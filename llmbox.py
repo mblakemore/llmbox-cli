@@ -570,7 +570,7 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
     print(f"Session log: {log_path}")
     print(f"Error log: {error_log_path}")
     print("Press Escape twice to cancel")
-    print("Type 'exit' or 'quit' to end conversation\n")
+    print("Type /help for commands\n")
 
     # Health check
     status = StreamStatus()
@@ -693,6 +693,16 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
         if user_input.lower() in ["exit", "quit"]:
             print("Goodbye!")
             break
+        if user_input.strip() == "/help":
+            print(f"  {BOLD}Commands:{RESET}")
+            print(f"    /help              Show this help message")
+            print(f"    /clear             Reset conversation history")
+            print(f"    /models            List available models")
+            print(f"    /model <name>      Set model (or pick from menu)")
+            print(f"    @file              Attach file contents to prompt")
+            print(f"    exit, quit         End session")
+            print(f"    Escape x2          Cancel current operation")
+            continue
         if user_input.strip() == "/clear":
             conversation_history.clear()
             summary_state["text"] = ""
@@ -700,6 +710,42 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
             initial_files = None
             log, log_path, error_log_path = _setup_logger()
             print(f"Conversation cleared. New session: {log_path}")
+            continue
+        if user_input.strip() == "/models":
+            models = _api.list_models()
+            if models:
+                print(f"  Current: {BOLD}{_api.model}{RESET}")
+                print(f"  Available:")
+                for m in models:
+                    marker = " *" if m == _api.model else ""
+                    print(f"    {m}{marker}")
+            else:
+                print("  Could not fetch model list")
+            continue
+        if user_input.strip().startswith("/model"):
+            parts = user_input.strip().split(None, 1)
+            if len(parts) == 2:
+                _api.model = parts[1]
+                print(f"  Model set to: {BOLD}{_api.model}{RESET}")
+            else:
+                models = _api.list_models()
+                if not models:
+                    print("  Could not fetch model list. Usage: /model <model-name>")
+                else:
+                    print(f"  Current: {BOLD}{_api.model}{RESET}")
+                    for i, m in enumerate(models, 1):
+                        marker = " (current)" if m == _api.model else ""
+                        print(f"    {i}. {m}{marker}")
+                    try:
+                        choice = input("  Select model number (or Enter to cancel): ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        continue
+                    if choice.isdigit() and 1 <= int(choice) <= len(models):
+                        _api.model = models[int(choice) - 1]
+                        print(f"  Model set to: {BOLD}{_api.model}{RESET}")
+                    elif choice:
+                        print("  Invalid selection")
             continue
 
         expanded, files, err = _expand_file_refs(user_input)
