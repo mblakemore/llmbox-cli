@@ -33,10 +33,17 @@ Or create a `config.json` in the working directory:
 
 ### Shell wrapper
 
-To use `llmbox` as a command, symlink the wrapper script to somewhere on your PATH:
+To use `llmbox` as a command from any directory, symlink the wrapper script to somewhere on your PATH:
 
 ```bash
-ln -s /path/to/llmbox-cli/llmbox.sh ~/.local/bin/llmbox
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/llmbox.sh" ~/.local/bin/llmbox
+```
+
+Make sure `~/.local/bin` is on your PATH. If it isn't, add this to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## Usage
