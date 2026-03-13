@@ -113,6 +113,46 @@ Add tool modules to a `tools/` directory in the working directory. Each module s
 
 Custom tools with the same name as built-in tools will override them.
 
+## Library usage
+
+`llmbox_lib` provides an `Agent` class for using the agent programmatically without terminal I/O.
+
+```python
+from llmbox_lib import Agent
+
+agent = Agent()
+result = agent.run("What files are in the current directory?", max_turns=5)
+print(result.text)
+```
+
+The `Agent` class accepts optional configuration, a custom system prompt, and callbacks:
+
+```python
+agent = Agent(
+    config={
+        "llm": {"model": "claude-v4.5-opus"},
+        "cycle": {"max_turns": 20},
+    },
+    system_prompt="You are a log analysis assistant. Be concise.",
+    on_tool=lambda name, args: print(f"  [tool] {name}"),
+    on_turn=lambda n, result: print(f"  [turn {n}] done"),
+)
+
+result = agent.run("Analyze the log files in /var/log/myapp")
+print(result.text)
+print(f"Completed in {result.total_turns} turns (status: {result.status})")
+```
+
+`run()` returns a `RunResult` with structured data:
+- `result.text` — final assistant text
+- `result.turns` — list of `TurnResult` objects, each with `.text`, `.tool_results`, `.reasoning`
+- `result.total_turns` — number of turns taken
+- `result.status` — `"done"`, `"max_turns"`, or `"error"`
+
+Use `agent.reset()` to clear conversation history between runs, or omit it to continue the same conversation across multiple `run()` calls.
+
+See `examples/process_automation.py` for a full example.
+
 ## How it works
 
 The agent uses a **prompt-stuffing** approach: each turn, it builds a single text prompt containing the system instructions, agent identity file, a rolling conversation summary, and recent message history — all fitted within a configurable context budget (default ~20k tokens). The LLM responds with text that may contain `<tool_call>` XML blocks, which are parsed and executed locally. This loop continues until the model responds without tool calls or the turn limit is reached.
