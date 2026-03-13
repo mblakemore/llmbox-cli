@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime state
+.history/
+
+# Config may contain API keys
+config.json
+
+# Claude Code
+CLAUDE.md
