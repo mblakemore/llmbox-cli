@@ -4,6 +4,7 @@ __pycache__/
 
 # Runtime state
 .history/
+state/
 
 # Config may contain API keys
 config.json

@@ -914,7 +914,7 @@ def main():
     parser.add_argument("-a", "--auto", action="store_true",
                         help="Automation mode: run prompt and exit (no interactive loop)")
     parser.add_argument("-c", "--continue", dest="continue_mode", action="store_true",
-                        help="Continue from last checkpoint (resume a crashed cycle)")
+                        help="Continue from last checkpoint")
     parser.add_argument("-r", "--repeat", type=int, nargs="?", const=0, default=None,
                         help="Repeat N times (fresh each run). 0 or omit = indefinite. Implies -a.")
     parser.add_argument("-m", "--model", default=None,

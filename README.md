@@ -48,7 +48,7 @@ llmbox
 # Single prompt (auto mode — runs and exits)
 llmbox -a "analyze the codebase and suggest improvements"
 
-# Resume a crashed session from checkpoint
+# Continue from last checkpoint
 llmbox -c
 
 # Repeat N times (0 = indefinite), implies auto mode
@@ -105,4 +105,4 @@ Custom tools with the same name as built-in tools will override them.
 
 The agent uses a **prompt-stuffing** approach: each turn, it builds a single text prompt containing the system instructions, agent identity file, a rolling conversation summary, and recent message history — all fitted within a configurable context budget (default ~20k tokens). The LLM responds with text that may contain `<tool_call>` XML blocks, which are parsed and executed locally. This loop continues until the model responds without tool calls or the turn limit is reached.
 
-Conversation state is checkpointed to `state/conversation_checkpoint.json` after each turn, enabling crash recovery with the `-c` flag.
+Conversation state is checkpointed to `state/conversation_checkpoint.json` after each turn, allowing you to continue from the last checkpoint with the `-c` flag.
