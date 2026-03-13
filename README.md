@@ -77,10 +77,15 @@ python llmbox.py -m claude-v4.5-opus "your prompt"
 
 ### Interactive commands
 
-- Type `exit` or `quit` to end the session
-- Type `/clear` to reset conversation history
-- Press **Escape twice** (within 400ms) to cancel the current operation
-- Reference files with `@path/to/file` to include their contents in the prompt
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/clear` | Reset conversation history |
+| `/models` | List available models from the gateway |
+| `/model <name>` | Set the model (or pick from a menu if no name given) |
+| `@path/to/file` | Attach file contents to your prompt |
+| `exit`, `quit` | End the session |
+| **Escape x2** | Cancel the current operation |
 
 ### Agent identity
 
