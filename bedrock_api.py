@@ -45,14 +45,20 @@ class BedrockChatAPI:
         except Exception:
             return False
 
-    def send(self, prompt: str, enable_reasoning: bool = False) -> tuple[str, str]:
-        """Send a message. Returns (conversation_id, message_id)."""
+    def send(self, prompt: str, enable_reasoning: bool = False,
+             conversation_id: str | None = None) -> tuple[str, str]:
+        """Send a message. Returns (conversation_id, message_id).
+
+        If conversation_id is provided, continues that conversation on the server.
+        """
         payload = {
             "message": {
                 "content": [{"contentType": "text", "body": prompt}],
                 "model": self.model,
             },
         }
+        if conversation_id:
+            payload["conversationId"] = conversation_id
         if enable_reasoning:
             payload["enableReasoning"] = True
 
@@ -79,11 +85,59 @@ class BedrockChatAPI:
                     return last_msg
         raise TimeoutError(f"No response after {self.poll_timeout}s")
 
+    def poll_message(self, conversation_id: str, message_id: str,
+                     cancel_check=None) -> dict:
+        """Poll a specific message until the assistant response is ready.
+
+        Uses GET /conversation/{conv_id}/{msg_id} which returns the assistant's
+        response to a specific user message. Returns 404 while processing.
+        """
+        deadline = time.time() + self.poll_timeout
+        while time.time() < deadline:
+            time.sleep(self.poll_interval)
+            if cancel_check:
+                cancel_check()
+            resp = self.session.get(
+                f"{self.api_url}/conversation/{conversation_id}/{message_id}",
+                timeout=30)
+            if resp.status_code == 404:
+                continue  # not ready yet
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data.get("message", {})
+            if msg.get("role") == "assistant":
+                return msg
+        raise TimeoutError(f"No response after {self.poll_timeout}s")
+
+    def get_conversation(self, conversation_id: str) -> dict:
+        """Fetch the full conversation tree from the server.
+
+        Returns the raw conversation dict with messageMap.
+        """
+        resp = self.session.get(
+            f"{self.api_url}/conversation/{conversation_id}", timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
     def send_and_wait(self, prompt: str, enable_reasoning: bool = False,
                       cancel_check=None) -> dict:
         """Send a message and wait for the response. Returns the full assistant message."""
         conv_id, _ = self.send(prompt, enable_reasoning)
         return self.poll(conv_id, cancel_check=cancel_check)
+
+    def send_and_wait_conv(self, prompt: str, conversation_id: str | None = None,
+                           cancel_check=None) -> tuple[dict, str]:
+        """Send a message and wait for the response, returning the conversation_id.
+
+        Returns (assistant_message, conversation_id). For continuing conversations,
+        uses message-specific polling for reliable response retrieval.
+        """
+        conv_id, msg_id = self.send(prompt, conversation_id=conversation_id)
+        if conversation_id:
+            msg = self.poll_message(conv_id, msg_id, cancel_check=cancel_check)
+        else:
+            msg = self.poll(conv_id, cancel_check=cancel_check)
+        return msg, conv_id
 
     def extract_text(self, msg: dict) -> str:
         """Extract text content from an assistant message."""
