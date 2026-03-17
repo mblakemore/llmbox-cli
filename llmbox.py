@@ -64,7 +64,10 @@ def _load_config():
                 user_config = json.load(f)
             for section, values in user_config.items():
                 if section in config and isinstance(config[section], dict):
-                    config[section].update(values)
+                    # Only override with non-empty values so env vars aren't clobbered
+                    for k, v in values.items():
+                        if v or v == 0 or v is False:
+                            config[section][k] = v
                 else:
                     config[section] = values
         except Exception as e:
