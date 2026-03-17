@@ -22,6 +22,13 @@ class CancelledError(Exception):
 _cancel_event = threading.Event()
 _monitor_active = threading.Event()
 _original_termios = None
+_tui_mode = False
+
+
+def set_tui_mode():
+    """Disable cbreak-based cancellation (prompt_toolkit manages the terminal)."""
+    global _tui_mode
+    _tui_mode = True
 
 
 def is_cancelled():
@@ -147,6 +154,8 @@ class cancellable:
 
     def __enter__(self):
         reset()
+        if _tui_mode:
+            return self  # prompt_toolkit manages the terminal
         if sys.stdin.isatty():
             self._cbreak = cbreak_mode()
             self._cbreak.__enter__()

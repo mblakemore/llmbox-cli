@@ -13,7 +13,7 @@ cd llmbox-cli
 ```
 
 The setup script will:
-1. Install Python dependencies (`requests`, `markdownify`, `PyMuPDF`)
+1. Install Python dependencies (`requests`, `markdownify`, `PyMuPDF`, `prompt_toolkit`)
 2. Add the `llmbox` command to your PATH
 3. Prompt for your API URL and key (saved to your shell profile)
 
@@ -28,7 +28,7 @@ llmbox
 If you prefer to set things up yourself:
 
 ```bash
-pip install requests markdownify PyMuPDF
+pip install requests markdownify PyMuPDF prompt_toolkit
 export BEDROCK_API_URL="https://your-api-gateway-url"
 export BEDROCK_API_KEY="your-api-key"
 python llmbox.py
@@ -73,9 +73,22 @@ python llmbox.py --mode long "your prompt"
 | `/mode [dev\|long]` | Show or switch conversation mode |
 | `/models` | List available models from the gateway |
 | `/model <name>` | Set the model (or pick from a menu if no name given) |
+| `/context` | Show context usage with progress bar |
+| `/verbose` | Toggle verbose tool output |
+| `/tools` | Show recent tool call history |
 | `@path/to/file` | Attach file contents to your prompt |
 | `exit`, `quit` | End the session |
-| **Escape x2** | Cancel the current operation |
+
+### Keyboard shortcuts
+
+| Key | Description |
+|-----|-------------|
+| **Enter** | Submit prompt |
+| **Ctrl+N** | Insert newline (multiline input) |
+| **Ctrl+C** | Cancel current operation |
+| **Tab** | Autocomplete (`/` commands, `@` file paths) |
+
+When `prompt_toolkit` is not installed, the TUI falls back to basic `input()` with double-escape cancellation.
 
 ### Agent identity
 
