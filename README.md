@@ -2,7 +2,7 @@
 
 An AI assistant CLI for the UCSB LLM Sandbox.
 
-![screenshot](docs/screenshot.png?v=2)
+![screenshot](docs/llmbox-screenshot.png)
 
 ## Setup
 
