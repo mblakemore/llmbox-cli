@@ -403,7 +403,7 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
 
     mode_label = f" | Mode: {agent.mode}" if agent.mode != "dev" else ""
     print("="*60)
-    print("Agent with File Tools - Bedrock Chat API")
+    print("llmbox - UCSB LLM Sandbox AI Assistant")
     print("="*60)
     print(f"Model: {agent.model} | Max turns: {agent.max_turns}{mode_label}")
     print(f"Session log: {log_path}")
@@ -655,7 +655,7 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Agent with file tools (Bedrock Chat API)")
+    parser = argparse.ArgumentParser(description="llmbox - UCSB LLM Sandbox AI Assistant")
     parser.add_argument("-a", "--auto", action="store_true",
                         help="Automation mode: run prompt and exit (no interactive loop)")
     parser.add_argument("-c", "--continue", dest="continue_mode", action="store_true",
