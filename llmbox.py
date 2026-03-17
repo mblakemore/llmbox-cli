@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Agent script with file reading/writing tools.
-Connects to Bedrock Chat Published API and executes tool calls in an agentic loop.
+Agent CLI — thin wrapper around llmbox_lib.Agent.
+
+Provides interactive terminal features: spinners, cancellation, checkpoint
+management, interactive commands (/help, /mode, /model, etc.).
 """
 
 import json
@@ -17,8 +19,8 @@ from pathlib import Path
 
 from cancel import cancellable, check_cancelled, CancelledError
 from spinner import StreamStatus
-from bedrock_api import BedrockChatAPI
-from tools import MAP_FN, tools, load_extra_tools
+from llmbox_lib import Agent, NullCallbacks, TurnResult
+from tools import tools
 from tools.exec_command import cleanup_temp_sessions
 
 DIM = "\033[90m"
@@ -28,8 +30,6 @@ RESET = "\033[0m"
 
 _FILE_REF = re.compile(r"@(\S+)")
 
-# Regex to extract tool calls from model output
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
 # ── Configuration ──────────────────────────────────────────────────────
 
@@ -46,7 +46,7 @@ _DEFAULT_CONFIG = {
         "max_full_lines": 400,
         "preview_lines": 100,
         "summary_threshold": 5,
-        "max_context_chars": 80000,  # ~20k tokens
+        "max_context_chars": 80000,
     },
     "cycle": {
         "max_turns": 100,
@@ -64,7 +64,6 @@ def _load_config():
                 user_config = json.load(f)
             for section, values in user_config.items():
                 if section in config and isinstance(config[section], dict):
-                    # Only override with non-empty values so env vars aren't clobbered
                     for k, v in values.items():
                         if v or v == 0 or v is False:
                             config[section][k] = v
@@ -79,100 +78,6 @@ _config = _load_config()
 
 _MAX_FULL_LINES = _config["context"]["max_full_lines"]
 _PREVIEW_LINES = _config["context"]["preview_lines"]
-_SUMMARY_THRESHOLD = _config["context"]["summary_threshold"]
-_MAX_CONTEXT_CHARS = _config["context"]["max_context_chars"]
-_MAX_TURNS = _config["cycle"]["max_turns"]
-_WIND_DOWN_TURNS = _config["cycle"]["wind_down_turns"]
-
-# Initialize API client
-_api = BedrockChatAPI(_config["llm"])
-
-# Load agent-specific tools from CWD/tools/ if it exists
-_agent_tools_dir = os.path.join(os.getcwd(), "tools")
-if os.path.isdir(_agent_tools_dir):
-    load_extra_tools(_agent_tools_dir)
-
-
-# ── Tool prompt generation ────────────────────────────────────────────
-
-def _build_tool_system_prompt():
-    """Generate a system prompt that describes all available tools."""
-    tool_descriptions = []
-    for tool_def in tools:
-        fn_def = tool_def["function"]
-        name = fn_def["name"]
-        desc = fn_def.get("description", "")
-        params = fn_def.get("parameters", {})
-        props = params.get("properties", {})
-        required = params.get("required", [])
-
-        param_lines = []
-        for pname, pinfo in props.items():
-            req = " (required)" if pname in required else ""
-            ptype = pinfo.get("type", "string")
-            pdesc = pinfo.get("description", "")
-            if pinfo.get("enum"):
-                pdesc += f" One of: {pinfo['enum']}"
-            param_lines.append(f"    - {pname} ({ptype}{req}): {pdesc}")
-
-        params_str = "\n".join(param_lines) if param_lines else "    (no parameters)"
-        tool_descriptions.append(f"  {name}: {desc}\n  Parameters:\n{params_str}")
-
-    tools_block = "\n\n".join(tool_descriptions)
-
-    return f"""\
-You are an autonomous agent with access to tools for file operations, \
-command execution, web fetching, and more.
-
-AVAILABLE TOOLS:
-{tools_block}
-
-TO USE A TOOL, include a tool call block in your response:
-
-<tool_call>
-{{"tool": "tool_name", "args": {{"param1": "value1", "param2": "value2"}}}}
-</tool_call>
-
-RULES:
-- You may use multiple tool calls in a single response.
-- After tool execution, you will receive results and can make more calls or give a final answer.
-- When done, respond with plain text (no tool_call block).
-- Always explain what you're doing before tool calls.
-- Be careful with destructive commands — ask before deleting files or modifying system config.
-- Do not use interactive commands (vim, less, top).
-- Read files before overwriting them.
-"""
-
-
-_TOOL_SYSTEM_PROMPT = _build_tool_system_prompt()
-
-
-# ── Text utilities ─────────────────────────────────────────────────────
-
-_UNICODE_MAP = str.maketrans({
-    "\u2014": "--", "\u2013": "-", "\u2018": "'", "\u2019": "'",
-    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u2022": "*",
-    "\u00a0": " ", "\u200b": "",
-})
-
-_THINK_TAG_RE = re.compile(r'</?think>')
-
-
-def _sanitize(text):
-    """Replace common Unicode characters with ASCII equivalents and strip think tags."""
-    text = _THINK_TAG_RE.sub('', text)
-    return text.translate(_UNICODE_MAP)
-
-
-# ── Token/char estimation ─────────────────────────────────────────────
-
-def _estimate_chars(msg):
-    """Estimate the character count of a conversation message."""
-    content = msg.get("content", "") or ""
-    total = len(content)
-    if msg.get("tool_calls"):
-        total += len(json.dumps(msg["tool_calls"]))
-    return max(1, total)
 
 
 # ── File reference expansion ──────────────────────────────────────────
@@ -227,200 +132,9 @@ def _expand_file_refs(text):
     return expanded, preamble + files_content if preamble else files_content, None
 
 
-# ── Summarization ─────────────────────────────────────────────────────
-
-def _format_for_summary(messages):
-    """Format messages into a readable transcript for the summarizer."""
-    parts = []
-    for m in messages:
-        role = m["role"].upper()
-        if role == "TOOL":
-            name = m.get("name", "?")
-            content = m.get("content", "")
-            is_error = content.startswith("Error") or "Error:" in content[:50]
-            max_len = 800 if is_error else 500
-            if len(content) > max_len:
-                content = content[:max_len] + "..."
-            parts.append(f"TOOL RESULT ({name}): {content}")
-        elif role == "ASSISTANT":
-            text = m.get("content", "")
-            tool_calls = m.get("tool_calls", [])
-            if text:
-                if len(text) > 600:
-                    text = text[:600] + "..."
-                parts.append(f"ASSISTANT: {text}")
-            for tc in tool_calls:
-                name = tc.get("name", "?")
-                args = json.dumps(tc.get("args", {}))
-                if len(args) > 200:
-                    args = args[:200] + "..."
-                parts.append(f"ASSISTANT called {name}({args})")
-        else:
-            content = m.get("content", "")
-            if len(content) > 800:
-                content = content[:800] + "..."
-            parts.append(f"{role}: {content}")
-    return "\n".join(parts)
-
-
-def _generate_summary(old_summary, new_messages, log):
-    """Call the LLM to produce an updated conversation summary."""
-    transcript = _format_for_summary(new_messages)
-
-    structure_instruction = (
-        "Structure the summary with these sections:\n"
-        "1. GOAL: The user's current objective\n"
-        "2. PROGRESS: What has been accomplished\n"
-        "3. DECISIONS & OUTCOMES: Key decisions made and their results "
-        "(include approaches that FAILED and why — this prevents repeating mistakes)\n"
-        "4. COMPLETED ACTIONS: List actions that are DONE and must NOT be repeated\n"
-        "5. CURRENT STATE: Where things stand right now, what files were modified\n"
-        "6. NEXT: The single next action to take\n"
-        "Keep it under 500 words. Be specific about file paths, error messages, and tool results."
-    )
-
-    if old_summary:
-        prompt = (
-            f"Here is the previous summary of the conversation so far:\n\n"
-            f"{old_summary}\n\n"
-            f"Here are the new messages since that summary:\n\n"
-            f"{transcript}\n\n"
-            f"Write an updated summary that combines the previous summary with the new messages.\n\n"
-            f"{structure_instruction}"
-        )
-    else:
-        prompt = (
-            f"Here is a conversation transcript:\n\n"
-            f"{transcript}\n\n"
-            f"Write a concise summary.\n\n"
-            f"{structure_instruction}"
-        )
-
-    log.info("Generating conversation summary...")
-    try:
-        msg = _api.send_and_wait(prompt)
-        summary = _api.extract_text(msg).strip()
-        log.info("SUMMARY: %s", summary)
-        return summary
-    except Exception as e:
-        log.error("Summary generation failed: %s", e)
-        return old_summary or ""
-
-
-# ── Context window management ─────────────────────────────────────────
-
-def _build_prompt(conversation_history, summary_state, initial_files, log,
-                  max_chars_override=None):
-    """Build the full prompt from conversation history using prompt stuffing.
-
-    Returns (prompt_str, oldest_included_idx).
-    """
-    max_chars = max_chars_override or _MAX_CONTEXT_CHARS
-    parts = []
-
-    # System prompt with tools
-    parts.append(f"[System]\n{_TOOL_SYSTEM_PROMPT}\n[End System]\n")
-
-    # Initial files (agent.md etc.) — always include if present
-    if initial_files:
-        parts.append(initial_files)
-
-    # Summary context
-    if summary_state["text"]:
-        parts.append(f"Progress summary of work done so far:\n{summary_state['text']}")
-        parts.append(
-            f"IMPORTANT: Your working directory is '{os.getcwd()}'. "
-            "Use relative paths — do not cd elsewhere. "
-            "Continue where you left off. Do not repeat already-completed steps."
-        )
-
-    # Build conversation from history (most recent first, within budget)
-    overhead = sum(len(p) for p in parts) + 500  # room for wrapper text
-    budget = max_chars - overhead
-    selected = []
-    oldest_idx = len(conversation_history)
-
-    for i in range(len(conversation_history) - 1, -1, -1):
-        msg = conversation_history[i]
-        msg_chars = _estimate_chars(msg)
-        if sum(_estimate_chars(m) for m in selected) + msg_chars > budget:
-            break
-        selected.append(msg)
-        oldest_idx = i
-
-    selected.reverse()
-
-    # Format messages
-    for msg in selected:
-        role = msg["role"]
-        content = msg.get("content", "")
-        if role == "user":
-            parts.append(f"User: {content}")
-        elif role == "assistant":
-            parts.append(f"Assistant: {content}")
-            # Include tool call info
-            if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    parts.append(f"[Tool call: {tc['name']}({json.dumps(tc.get('args', {}))})]")
-        elif role == "tool":
-            name = msg.get("name", "?")
-            parts.append(f"[Tool result ({name}): {content}]")
-
-    prompt = "\n\n".join(parts) + "\n\nAssistant:"
-
-    log.debug("Prompt built: %d chars, %d messages included (oldest_idx=%d)",
-              len(prompt), len(selected), oldest_idx)
-    return prompt, oldest_idx
-
-
-def _maybe_resummarize(conversation_history, summary_state, oldest_idx, log, force=False):
-    """Check if enough messages have fallen out of the window to warrant a new summary."""
-    unsummarized = oldest_idx - summary_state["up_to"]
-
-    if not force and unsummarized < _SUMMARY_THRESHOLD:
-        return False
-
-    new_messages = conversation_history[summary_state["up_to"]:oldest_idx]
-    print(f"  {DIM}[summarizing {len(new_messages)} messages...]{RESET}", flush=True)
-    summary = _generate_summary(summary_state["text"], new_messages, log)
-    summary_state["text"] = summary
-    summary_state["up_to"] = oldest_idx
-    print(f"  {DIM}[summary updated]{RESET}")
-    return True
-
-
-# ── Tool call parsing ─────────────────────────────────────────────────
-
-def _parse_tool_calls(response_text):
-    """Extract tool calls from model response text.
-
-    Returns list of dicts with 'name' and 'args' keys.
-    """
-    calls = []
-    for match in _TOOL_CALL_RE.finditer(response_text):
-        try:
-            data = json.loads(match.group(1))
-            name = data.get("tool") or data.get("name")
-            args = data.get("args") or data.get("arguments") or {}
-            # Handle flat format: {"tool": "exec_command", "command": "ls"}
-            if not args and name:
-                args = {k: v for k, v in data.items() if k not in ("tool", "name")}
-            if name:
-                calls.append({"name": name, "args": args})
-        except json.JSONDecodeError:
-            continue
-    return calls
-
-
-def _strip_tool_calls(response_text):
-    """Remove tool call blocks from response text."""
-    return _TOOL_CALL_RE.sub("", response_text).strip()
-
-
 # ── Logger setup ──────────────────────────────────────────────────────
 
 def _setup_logger():
-    """Create a structured logger with levels, rotation, and console output."""
     history_dir = os.path.join(os.getcwd(), ".history")
     os.makedirs(history_dir, exist_ok=True)
 
@@ -452,20 +166,24 @@ def _setup_logger():
     return logger, log_path, error_log_path
 
 
-# ── Conversation checkpoints (for -c continue) ──────────────────────
+# ── Conversation checkpoints ──────────────────────────────────────────
 
 _CHECKPOINT_PATH = os.path.join(os.getcwd(), "state", "conversation_checkpoint.json")
 
 
-def _save_checkpoint(conversation_history, summary_state, turn, initial_files):
+def _save_checkpoint(agent, turn=0):
     """Save conversation state so a crashed cycle can be resumed with -c."""
     try:
         checkpoint = {
-            "conversation_history": conversation_history,
-            "summary_state": summary_state,
+            "mode": agent.mode,
             "turn": turn,
-            "initial_files": initial_files,
+            "conversation_history": agent.conversation_history,
+            "summary_state": agent.summary_state,
+            "initial_files": agent.initial_files,
         }
+        if agent.mode == "long" and agent.conversation_id:
+            checkpoint["conversation_id"] = agent.conversation_id
+            checkpoint["approx_chars"] = agent.approx_char_usage
         os.makedirs(os.path.dirname(_CHECKPOINT_PATH), exist_ok=True)
         with open(_CHECKPOINT_PATH, "w") as f:
             json.dump(checkpoint, f)
@@ -474,24 +192,16 @@ def _save_checkpoint(conversation_history, summary_state, turn, initial_files):
 
 
 def _load_checkpoint():
-    """Load a saved conversation checkpoint."""
     if not os.path.exists(_CHECKPOINT_PATH):
         return None
     try:
         with open(_CHECKPOINT_PATH) as f:
-            cp = json.load(f)
-        return (
-            cp["conversation_history"],
-            cp["summary_state"],
-            cp.get("turn", 0),
-            cp.get("initial_files"),
-        )
+            return json.load(f)
     except Exception:
         return None
 
 
 def _delete_checkpoint():
-    """Remove checkpoint after a clean exit."""
     try:
         if os.path.exists(_CHECKPOINT_PATH):
             os.remove(_CHECKPOINT_PATH)
@@ -502,7 +212,6 @@ def _delete_checkpoint():
 # ── Cycle auto-increment ─────────────────────────────────────────────
 
 def _auto_increment_cycle(log):
-    """Check if the current cycle was already committed and bump if so."""
     state_path = os.path.join(os.getcwd(), "state", "current-state.json")
     if not os.path.exists(state_path):
         return
@@ -559,17 +268,144 @@ def _auto_increment_cycle(log):
         log.warning("Auto-increment check failed: %s", e)
 
 
+# ── Terminal callbacks ────────────────────────────────────────────────
+
+class TerminalCallbacks(NullCallbacks):
+    """Callbacks that provide terminal UI: spinners, cancellation, output, checkpoints."""
+
+    def __init__(self, agent, log, auto=False):
+        self.agent = agent
+        self.log = log
+        self.auto = auto
+        self._status = None
+        self._tool_status = None
+        self._cancellable = None
+
+    def check_cancelled(self):
+        check_cancelled()
+
+    def on_api_start(self, label):
+        self._cancellable = cancellable()
+        self._cancellable.__enter__()
+        self._status = StreamStatus()
+        self._status.start(label)
+
+    def on_api_response(self):
+        if self._status:
+            self._status.first_token()
+
+    def on_api_done(self):
+        if self._status:
+            self._status.finish()
+            self._status = None
+        if self._cancellable:
+            self._cancellable.__exit__(None, None, None)
+            self._cancellable = None
+
+    def on_assistant_text(self, text, reasoning):
+        if reasoning:
+            print(f"{BLUE}[Reasoning]\n{reasoning}{RESET}\n")
+        if text:
+            print(text)
+
+    def on_tool_batch_start(self, count):
+        # Enter cancellable mode for tool execution
+        self._cancellable = cancellable()
+        self._cancellable.__enter__()
+        print(f"\n{DIM}Executing {count} tool call(s)...")
+
+    def on_tool_start(self, name, args):
+        if name not in {"think"}:
+            self._tool_status = StreamStatus()
+            self._tool_status.start(f"  -> {name} ")
+        else:
+            self._tool_status = None
+
+    def on_tool_result(self, name, args, result, is_error):
+        if self._tool_status:
+            self._tool_status.first_token()
+            self._tool_status.finish()
+            self._tool_status = None
+        args_str = ', '.join(f'{k}={repr(v)[:50]}' for k, v in args.items())
+        print(f"\r\033[K  -> {name}({args_str})")
+        print(f"    Result: {result}{RESET}")
+
+    def on_turn_end(self, turn, turn_result):
+        # Exit cancellable mode if still active
+        if self._cancellable:
+            self._cancellable.__exit__(None, None, None)
+            self._cancellable = None
+        _save_checkpoint(self.agent, turn)
+
+    def on_summary_start(self, count):
+        print(f"  {DIM}[summarizing {count} messages...]{RESET}", flush=True)
+
+    def on_summary_done(self):
+        print(f"  {DIM}[summary updated]{RESET}")
+
+    def on_forced_think(self, tool_name, count):
+        print(f"  [loop detected — forcing think]")
+
+    def on_truncation_recovered(self, attempts):
+        print(f"  {DIM}[truncation recovered after {attempts} continuation(s)]{RESET}")
+
+    def on_truncation_failed(self, attempts):
+        print(f"  {BOLD}[WARNING: response still truncated after {attempts} continuations]{RESET}")
+
+    def on_context_recovery(self, auto):
+        print(f"\n  {BOLD}[Context limit approaching — recovering...]{RESET}")
+
+        if auto:
+            self.log.info("Auto recovery: switching to dev mode")
+            print(f"  {DIM}[auto-switching to dev mode]{RESET}")
+            return "dev"
+
+        print(f"\n  {BOLD}Context limit reached. Choose how to continue:{RESET}")
+        print(f"    1. Continue in long mode (new server conversation, summary carried over)")
+        print(f"    2. Switch to dev mode (prompt stuffing, unlimited context)")
+        try:
+            choice = input("  Choice [1/2, default=2]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "2"
+
+        if choice == "1":
+            self.log.info("Recovery: continuing in long mode")
+            print(f"  {DIM}[starting new long mode conversation]{RESET}")
+            return "long"
+        else:
+            self.log.info("Recovery: switching to dev mode")
+            print(f"  {DIM}[switching to dev mode]{RESET}")
+            return "dev"
+
+
 # ── Main agent loop ───────────────────────────────────────────────────
 
-def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
+def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
+                          mode="dev", model_override=None):
     """Interactive agent that maintains conversation history."""
 
     log, log_path, error_log_path = _setup_logger()
 
+    # Create agent
+    agent = Agent(config=_config, log=log, mode=mode)
+    if model_override:
+        agent.model = model_override
+
+    # Load agent-specific tools from CWD/tools/
+    agent_tools_dir = os.path.join(os.getcwd(), "tools")
+    if os.path.isdir(agent_tools_dir):
+        from tools import load_extra_tools
+        load_extra_tools(agent_tools_dir)
+
+    # Set up callbacks (needs agent reference)
+    cb = TerminalCallbacks(agent=agent, log=log, auto=auto)
+    agent.cb = cb
+
+    mode_label = f" | Mode: {agent.mode}" if agent.mode != "dev" else ""
     print("="*60)
     print("Agent with File Tools - Bedrock Chat API")
     print("="*60)
-    print(f"Model: {_api.model} | Max turns: {_MAX_TURNS}")
+    print(f"Model: {agent.model} | Max turns: {agent.max_turns}{mode_label}")
     print(f"Session log: {log_path}")
     print(f"Error log: {error_log_path}")
     print("Press Escape twice to cancel")
@@ -578,7 +414,7 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
     # Health check
     status = StreamStatus()
     status.start("  Checking API health ")
-    healthy = _api.health()
+    healthy = agent.health()
     status.first_token()
     status.finish()
     if healthy:
@@ -586,31 +422,51 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
     else:
         print(f"  {BOLD}[WARNING: API health check failed]{RESET}")
 
-    log.info("Session started | model=%s max_turns=%d", _api.model, _MAX_TURNS)
+    log.info("Session started | model=%s max_turns=%d mode=%s",
+             agent.model, agent.max_turns, agent.mode)
     log.info("Tools registered: %s", [t["function"]["name"] for t in tools])
 
     # ── Continue mode: resume from checkpoint ──
     start_turn = 0
-    conversation_history = []
-    summary_state = {"text": "", "up_to": 0}
-    initial_files = None
 
     if continue_mode:
         cp = _load_checkpoint()
         if cp:
-            conversation_history, summary_state, start_turn, initial_files = cp
-            log.info("CONTINUE: resuming from checkpoint (turn %d, %d messages)",
-                     start_turn, len(conversation_history))
-            print(f"  [continuing from turn {start_turn} with {len(conversation_history)} messages]")
-            conversation_history.append({"role": "user", "content":
+            agent.conversation_history = cp.get("conversation_history", [])
+            agent.summary_state = cp.get("summary_state", {"text": "", "up_to": 0})
+            start_turn = cp.get("turn", 0)
+            agent.initial_files = cp.get("initial_files")
+            cp_mode = cp.get("mode", "dev")
+
+            if cp_mode == "long":
+                cp_conv_id = cp.get("conversation_id")
+                if cp_conv_id:
+                    try:
+                        agent.api.get_conversation(cp_conv_id)
+                        agent.mode = "long"
+                        agent.conversation_id = cp_conv_id
+                        agent.approx_char_usage = cp.get("approx_chars", 0)
+                        log.info("CONTINUE: restored long mode conversation %s", cp_conv_id)
+                        print(f"  {DIM}[restored long mode conversation]{RESET}")
+                    except Exception:
+                        log.warning("CONTINUE: long mode conversation lost — falling back to dev")
+                        print(f"  {BOLD}[long mode conversation lost — falling back to dev mode]{RESET}")
+                        agent.mode = "dev"
+
+            log.info("CONTINUE: resuming from checkpoint (turn %d, %d messages, mode=%s)",
+                     start_turn, len(agent.conversation_history), agent.mode)
+            print(f"  [continuing from turn {start_turn} with {len(agent.conversation_history)} messages]")
+
+            agent.conversation_history.append({"role": "user", "content":
                 "Continue where you left off. The session was interrupted — "
                 "pick up from your current phase and finish the cycle."})
-            result = run_agent_single(conversation_history, summary_state, initial_files, log,
-                                      start_turn=start_turn)
+            result = agent.run_continue(auto=auto, start_turn=start_turn)
+
             if auto:
                 cleanup_temp_sessions()
                 _delete_checkpoint()
-                log.info("Session ended (continue mode) | %d messages", len(conversation_history))
+                log.info("Session ended (continue mode) | %d messages",
+                         len(agent.conversation_history))
                 return
         else:
             print("  [no checkpoint found — starting fresh]")
@@ -620,10 +476,6 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
         _auto_increment_cycle(log)
 
     if not (continue_mode and start_turn > 0):
-        conversation_history = []
-        summary_state = {"text": "", "up_to": 0}
-        initial_files = None
-
         # Auto-load agent.md from cwd if present
         agent_md = Path(os.getcwd()) / "agent.md"
         if agent_md.exists():
@@ -638,7 +490,7 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
                 f"All relative paths resolve from here. "
                 f"Do not cd to other repositories or search for files outside this tree.]\n\n"
             )
-            initial_files = f"{preamble}{header}\n{content}"
+            agent.initial_files = f"{preamble}{header}\n{content}"
             print(f"  {DIM}{header}{RESET}")
             log.info("Auto-loaded agent.md (%d lines)", total)
 
@@ -649,18 +501,18 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
             print(err)
             return
         if files:
-            initial_files = files
-        conversation_history.append({"role": "user", "content": expanded})
+            agent.initial_files = files
+
         log.info("USER: %s", expanded)
-        result = run_agent_single(conversation_history, summary_state, initial_files, log)
+        result = agent.run(expanded, auto=auto)
 
         if auto:
-            if result == "cancelled":
+            if result.status == "cancelled":
                 print(f"\n{BOLD}[Agent paused — enter guidance, or press Enter to resume]{RESET}")
                 try:
                     guidance = input("\nOperator: ").strip()
                 except (EOFError, KeyboardInterrupt):
-                    log.info("Session ended (operator cancelled) | %d messages", len(conversation_history))
+                    log.info("Session ended (operator cancelled)")
                     print()
                     return
                 if guidance:
@@ -669,19 +521,19 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
                         print(err_g)
                     else:
                         if files_g:
-                            initial_files = files_g
-                        conversation_history.append({"role": "user", "content": expanded_g})
-                        log.info("OPERATOR: %s", expanded_g)
+                            agent.initial_files = files_g
+                        agent.run(expanded_g, auto=auto)
                 else:
-                    conversation_history.append({"role": "user", "content":
-                        "Continue where you left off. Finish your current cycle."})
-                    log.info("OPERATOR: [resume — no guidance]")
-                run_agent_single(conversation_history, summary_state, initial_files, log)
+                    agent.run("Continue where you left off. Finish your current cycle.",
+                              auto=auto)
+
             cleanup_temp_sessions()
             _delete_checkpoint()
-            log.info("Session ended (auto mode) | %d messages in history", len(conversation_history))
+            log.info("Session ended (auto mode) | %d messages",
+                     len(agent.conversation_history))
             return
 
+    # ── Interactive loop ──
     while True:
         try:
             user_input = input("\nYou: ").strip()
@@ -696,48 +548,80 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
         if user_input.lower() in ["exit", "quit"]:
             print("Goodbye!")
             break
+
+        # ── Commands ──
         if user_input.strip() == "/help":
             print(f"  {BOLD}Commands:{RESET}")
             print(f"    /help              Show this help message")
             print(f"    /clear             Reset conversation history")
+            print(f"    /mode [dev|long]   Show or switch conversation mode")
             print(f"    /models            List available models")
             print(f"    /model <name>      Set model (or pick from menu)")
             print(f"    @file              Attach file contents to prompt")
             print(f"    exit, quit         End session")
             print(f"    Escape x2          Cancel current operation")
+            print(f"\n  {BOLD}Modes:{RESET}")
+            print(f"    dev                Prompt stuffing with rolling summary (default)")
+            print(f"    long               Server-side conversation caching")
             continue
+
+        if user_input.strip().startswith("/mode"):
+            parts = user_input.strip().split(None, 1)
+            if len(parts) == 1:
+                print(f"  Mode: {BOLD}{agent.mode}{RESET}")
+                if agent.mode == "dev":
+                    print(f"    Messages: {len(agent.conversation_history)}")
+                    print(f"    Summary: {len(agent.summary_state.get('text', ''))} chars")
+                    print(f"    Context budget: {agent.max_context_chars:,} chars")
+                else:
+                    print(f"    Conversation: {agent.conversation_id or '(none)'}")
+                    limit = agent._get_context_limit_chars()
+                    print(f"    Approx usage: {agent.approx_char_usage:,} / {limit:,} chars "
+                          f"({agent.approx_char_usage * 100 // max(limit, 1)}%)")
+            else:
+                new_mode = parts[1].strip().lower()
+                if new_mode not in ("dev", "long"):
+                    print(f"  Unknown mode '{new_mode}'. Use 'dev' or 'long'.")
+                elif new_mode == agent.mode:
+                    print(f"  Already in {agent.mode} mode.")
+                else:
+                    print(f"  {DIM}[switching to {new_mode} mode...]{RESET}")
+                    agent.switch_mode(new_mode)
+                    print(f"  Switched to {BOLD}{new_mode}{RESET} mode (summary carried over)")
+            continue
+
         if user_input.strip() == "/clear":
-            conversation_history.clear()
-            summary_state["text"] = ""
-            summary_state["up_to"] = 0
-            initial_files = None
+            agent.reset()
+            agent.initial_files = None
             log, log_path, error_log_path = _setup_logger()
             print(f"Conversation cleared. New session: {log_path}")
             continue
+
         if user_input.strip() == "/models":
-            models = _api.list_models()
+            models = agent.list_models()
             if models:
-                print(f"  Current: {BOLD}{_api.model}{RESET}")
+                print(f"  Current: {BOLD}{agent.model}{RESET}")
                 print(f"  Available:")
                 for m in models:
-                    marker = " *" if m == _api.model else ""
+                    marker = " *" if m == agent.model else ""
                     print(f"    {m}{marker}")
             else:
                 print("  Could not fetch model list")
             continue
+
         if user_input.strip().startswith("/model"):
             parts = user_input.strip().split(None, 1)
             if len(parts) == 2:
-                _api.model = parts[1]
-                print(f"  Model set to: {BOLD}{_api.model}{RESET}")
+                agent.model = parts[1]
+                print(f"  Model set to: {BOLD}{agent.model}{RESET}")
             else:
-                models = _api.list_models()
+                models = agent.list_models()
                 if not models:
                     print("  Could not fetch model list. Usage: /model <model-name>")
                 else:
-                    print(f"  Current: {BOLD}{_api.model}{RESET}")
+                    print(f"  Current: {BOLD}{agent.model}{RESET}")
                     for i, m in enumerate(models, 1):
-                        marker = " (current)" if m == _api.model else ""
+                        marker = " (current)" if m == agent.model else ""
                         print(f"    {i}. {m}{marker}")
                     try:
                         choice = input("  Select model number (or Enter to cancel): ").strip()
@@ -745,219 +629,31 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False):
                         print()
                         continue
                     if choice.isdigit() and 1 <= int(choice) <= len(models):
-                        _api.model = models[int(choice) - 1]
-                        print(f"  Model set to: {BOLD}{_api.model}{RESET}")
+                        agent.model = models[int(choice) - 1]
+                        print(f"  Model set to: {BOLD}{agent.model}{RESET}")
                     elif choice:
                         print("  Invalid selection")
             continue
 
+        # ── Regular prompt ──
         expanded, files, err = _expand_file_refs(user_input)
         if err:
             print(err)
             continue
         if files:
-            initial_files = files
+            agent.initial_files = files
 
-        conversation_history.append({"role": "user", "content": expanded})
         log.info("USER: %s", expanded)
-
-        run_agent_single(conversation_history, summary_state, initial_files, log)
+        agent.run(expanded, auto=False)
 
     cleanup_temp_sessions()
     _delete_checkpoint()
-    log.info("Session ended | %d messages in history", len(conversation_history))
+    log.info("Session ended | %d messages in history", len(agent.conversation_history))
 
 
-def run_agent_single(conversation_history: list, summary_state: dict, initial_files,
-                     log: logging.Logger, start_turn=0):
-    """Run the agentic loop with turn limits and wind-down."""
-
-    turn = start_turn
-
-    # Track repeated tool failures to break infinite loops
-    _recent_tool_errors = []
-    _REPEAT_THRESHOLD = 3
-
-    while True:
-        turn += 1
-
-        # ── Wind-down and overtime warnings ──
-        remaining = _MAX_TURNS - turn
-        wind_down_msg = None
-        if 0 < remaining <= _WIND_DOWN_TURNS:
-            wind_down_msg = (
-                f"[SYSTEM: {remaining} turns remaining before overtime. "
-                f"Begin wrapping up — save your progress (CONSOLIDATE), "
-                f"commit your work (PERSIST), and stop. "
-                f"Do not start new tasks.]"
-            )
-            log.info("Wind-down: %d turns remaining", remaining)
-        elif remaining <= 0:
-            overtime = -remaining
-            wind_down_msg = (
-                f"[SYSTEM: You are {overtime} turns past the turn limit. "
-                f"Finish what you are doing immediately — CONSOLIDATE and PERSIST now. "
-                f"Do not start anything new.]"
-            )
-            log.warning("Overtime: %d turns past limit (%d)", overtime, _MAX_TURNS)
-
-        # Build the prompt
-        prompt, oldest_idx = _build_prompt(
-            conversation_history, summary_state, initial_files, log)
-
-        # Resummarize if needed
-        if _maybe_resummarize(conversation_history, summary_state, oldest_idx, log):
-            prompt, oldest_idx = _build_prompt(
-                conversation_history, summary_state, initial_files, log)
-
-        # Inject wind-down
-        if wind_down_msg:
-            prompt = prompt.rstrip()
-            if prompt.endswith("Assistant:"):
-                prompt = prompt[:-len("Assistant:")]
-            prompt += f"\n\n{wind_down_msg}\n\nAssistant:"
-
-        log.info("--- Turn %d/%d | prompt %d chars (history has %d msgs)",
-                 turn, _MAX_TURNS, len(prompt), len(conversation_history))
-
-        # Call the model
-        status = StreamStatus()
-        status.start("\nAssistant: ")
-
-        try:
-            with cancellable():
-                msg = _api.send_and_wait(prompt, cancel_check=check_cancelled)
-        except CancelledError:
-            status.finish()
-            print(f"\n[cancelled]{RESET}")
-            log.info("CANCELLED during API call")
-            return "cancelled"
-        except TimeoutError:
-            status.finish()
-            log.error("API call timed out")
-            print(f"\n  {DIM}[timed out waiting for response]{RESET}")
-            return "error"
-        except Exception as e:
-            status.finish()
-            log.error("API call failed: %s", e)
-            print(f"\nError calling API: {e}")
-            return "error"
-
-        status.first_token()
-        status.finish()
-
-        # Extract response
-        full_content = _api.extract_text(msg)
-        reasoning = _api.extract_reasoning(msg)
-
-        if reasoning:
-            print(f"{BLUE}[Reasoning]\n{reasoning}{RESET}\n")
-
-        # Parse tool calls
-        tool_calls = _parse_tool_calls(full_content)
-        text_part = _strip_tool_calls(full_content)
-
-        if text_part:
-            text_part = _sanitize(text_part)
-            # Strip leading "Assistant:" if echoed
-            if text_part.startswith("Assistant:"):
-                text_part = text_part[len("Assistant:"):].strip()
-            print(text_part)
-
-        log.info("ASSISTANT: %s", full_content[:500])
-
-        # Record in history
-        assistant_msg = {"role": "assistant", "content": full_content}
-        if tool_calls:
-            assistant_msg["tool_calls"] = tool_calls
-        conversation_history.append(assistant_msg)
-
-        if not tool_calls:
-            log.info("No tool calls — stopping")
-            return "done"
-
-        # Execute tool calls
-        log.info("Executing %d tool call(s)", len(tool_calls))
-        print(f"\n{DIM}Executing {len(tool_calls)} tool call(s)...")
-        try:
-            with cancellable():
-                for tc in tool_calls:
-                    check_cancelled()
-                    func_name = tc["name"]
-                    func_args = tc["args"]
-
-                    log.info("TOOL CALL: %s(%s)", func_name, json.dumps(func_args))
-
-                    _STREAMING_TOOLS = {"think"}
-                    use_spinner = func_name not in _STREAMING_TOOLS
-
-                    if use_spinner:
-                        tool_status = StreamStatus()
-                        tool_status.start(f"  -> {func_name} ")
-
-                    if func_name not in MAP_FN:
-                        result_str = f"Error: Unknown tool '{func_name}'"
-                    else:
-                        try:
-                            result_str = str(MAP_FN[func_name](**func_args))
-                        except Exception as e:
-                            result_str = f"Error executing tool: {str(e)}"
-
-                    if use_spinner:
-                        tool_status.first_token()
-                        tool_status.finish()
-                    print(f"\r\033[K  -> {func_name}({', '.join(f'{k}={repr(v)[:50]}' for k, v in func_args.items())})")
-
-                    conversation_history.append({
-                        "role": "tool",
-                        "name": func_name,
-                        "content": result_str,
-                    })
-
-                    log.info("TOOL RESULT [%s]: %s", func_name, result_str[:500])
-
-                    # Track repeated errors to detect infinite loops
-                    if result_str.startswith("Error"):
-                        error_sig = (func_name, result_str[:100])
-                        _recent_tool_errors.append(error_sig)
-                        consecutive = sum(1 for e in _recent_tool_errors if e == error_sig)
-                        if consecutive >= _REPEAT_THRESHOLD:
-                            think_prompt = (
-                                f"MANDATORY REFLECTION: I have called {func_name} "
-                                f"{consecutive} times and gotten the same error each time.\n\n"
-                                f"The error is: {result_str[:300]}\n\n"
-                                f"My last arguments were: {json.dumps(func_args)}\n\n"
-                                f"I MUST answer these questions:\n"
-                                f"1. What exactly is the error telling me?\n"
-                                f"2. What parameter am I missing or getting wrong?\n"
-                                f"3. What is a DIFFERENT way to accomplish my goal?\n"
-                                f"4. Should I just skip this step and move on?"
-                            )
-                            log.warning("Loop detected: %s x%d — forcing think",
-                                        func_name, consecutive)
-                            print(f"  [loop detected — forcing think]")
-                            if "think" in MAP_FN:
-                                think_result = MAP_FN["think"](prompt=think_prompt)
-                                conversation_history.append({
-                                    "role": "assistant",
-                                    "content": f"[Forced reflection]\n{think_result}",
-                                })
-                                log.info("FORCED THINK RESULT: %s", think_result)
-                    else:
-                        _recent_tool_errors[:] = [e for e in _recent_tool_errors if e[0] != func_name]
-                    print(f"    Result: {result_str}{RESET}")
-        except CancelledError:
-            print(f"\n[cancelled]{RESET}")
-            log.info("CANCELLED during tool execution")
-            _save_checkpoint(conversation_history, summary_state, turn, initial_files)
-            return "cancelled"
-
-        # Save checkpoint after each turn
-        _save_checkpoint(conversation_history, summary_state, turn, initial_files)
-
+# ── Entry point ──────────────────────────────────────────────────────
 
 def main():
-    """Main entry point."""
     import argparse
     parser = argparse.ArgumentParser(description="Agent with file tools (Bedrock Chat API)")
     parser.add_argument("-a", "--auto", action="store_true",
@@ -968,16 +664,17 @@ def main():
                         help="Repeat N times (fresh each run). 0 or omit = indefinite. Implies -a.")
     parser.add_argument("-m", "--model", default=None,
                         help="Override model (e.g. claude-v4.5-opus)")
+    parser.add_argument("--mode", choices=["dev", "long"], default="dev",
+                        help="Conversation mode: dev (prompt stuffing) or long (server-side caching)")
     parser.add_argument("prompt", nargs="*", help="Initial prompt")
     args = parser.parse_args()
-
-    if args.model:
-        _api.model = args.model
 
     initial_prompt = " ".join(args.prompt).strip() or None
 
     if args.continue_mode:
-        run_agent_interactive(initial_prompt=initial_prompt, auto=True, continue_mode=True)
+        run_agent_interactive(initial_prompt=initial_prompt, auto=True,
+                              continue_mode=True, mode=args.mode,
+                              model_override=args.model)
     elif args.repeat is not None:
         n = args.repeat
         run = 0
@@ -986,11 +683,13 @@ def main():
                 run += 1
                 label = f"run {run}/{n}" if n > 0 else f"run {run}"
                 print(f"\n{'='*60}\n{label}\n{'='*60}")
-                run_agent_interactive(initial_prompt=initial_prompt, auto=True)
+                run_agent_interactive(initial_prompt=initial_prompt, auto=True,
+                                      mode=args.mode, model_override=args.model)
         except KeyboardInterrupt:
             print(f"\n\nStopped after {run} run(s).")
     else:
-        run_agent_interactive(initial_prompt=initial_prompt, auto=args.auto)
+        run_agent_interactive(initial_prompt=initial_prompt, auto=args.auto,
+                              mode=args.mode, model_override=args.model)
 
 
 if __name__ == "__main__":

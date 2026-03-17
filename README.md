@@ -63,6 +63,10 @@ llmbox -r 3 "run the next cycle"
 
 # Override the model
 llmbox -m claude-v4.5-opus "your prompt"
+
+# Use long mode (server-side conversation caching)
+llmbox --mode long
+llmbox --mode long -a "research this topic in depth"
 ```
 
 ### Running with Python directly
@@ -73,6 +77,7 @@ python llmbox.py -a "your prompt"
 python llmbox.py -c
 python llmbox.py -r 3 "run the next cycle"
 python llmbox.py -m claude-v4.5-opus "your prompt"
+python llmbox.py --mode long "your prompt"
 ```
 
 ### Interactive commands
@@ -81,6 +86,7 @@ python llmbox.py -m claude-v4.5-opus "your prompt"
 |---------|-------------|
 | `/help` | Show available commands |
 | `/clear` | Reset conversation history |
+| `/mode [dev\|long]` | Show or switch conversation mode |
 | `/models` | List available models from the gateway |
 | `/model <name>` | Set the model (or pick from a menu if no name given) |
 | `@path/to/file` | Attach file contents to your prompt |
@@ -113,6 +119,22 @@ Add tool modules to a `tools/` directory in the working directory. Each module s
 
 Custom tools with the same name as built-in tools will override them.
 
+## Conversation modes
+
+The agent supports two conversation modes, selectable via `--mode` or `/mode`:
+
+| | **dev** (default) | **long** |
+|---|---|---|
+| Context strategy | Client-side prompt stuffing with rolling summarization | Server-side conversation caching |
+| Best for | Development workflows, agentic tool use, code generation | Extended Q&A, research, brainstorming |
+| Max session length | Unlimited (summary compresses indefinitely) | Bounded by model context window |
+
+**dev mode** rebuilds the full prompt each turn from recent history and a rolling summary. Old messages are automatically summarized and pruned. Best for tool-heavy workflows.
+
+**long mode** uses the server's conversation memory. The server retains all messages exactly, giving perfect recall of earlier turns. When the context window fills up, it recovers by summarizing and starting a new conversation (or switching to dev mode).
+
+Switch modes mid-session with `/mode dev` or `/mode long`. Use `/mode` to see current stats.
+
 ## Library usage
 
 `llmbox_lib` provides an `Agent` class for using the agent programmatically without terminal I/O.
@@ -125,7 +147,7 @@ result = agent.run("What files are in the current directory?", max_turns=5)
 print(result.text)
 ```
 
-The `Agent` class accepts optional configuration, a custom system prompt, and callbacks:
+The `Agent` class accepts optional configuration, a custom system prompt, callbacks, and a mode:
 
 ```python
 agent = Agent(
@@ -136,6 +158,7 @@ agent = Agent(
     system_prompt="You are a log analysis assistant. Be concise.",
     on_tool=lambda name, args: print(f"  [tool] {name}"),
     on_turn=lambda n, result: print(f"  [turn {n}] done"),
+    mode="long",  # use server-side conversation caching
 )
 
 result = agent.run("Analyze the log files in /var/log/myapp")
@@ -149,12 +172,14 @@ print(f"Completed in {result.total_turns} turns (status: {result.status})")
 - `result.total_turns` — number of turns taken
 - `result.status` — `"done"`, `"max_turns"`, or `"error"`
 
-Use `agent.reset()` to clear conversation history between runs, or omit it to continue the same conversation across multiple `run()` calls.
+Use `agent.reset()` to clear conversation history between runs, or omit it to continue the same conversation across multiple `run()` calls. Use `agent.switch_mode("long")` to switch modes with summary carry-over.
 
 See `examples/process_automation.py` for a full example.
 
 ## How it works
 
-The agent uses a **prompt-stuffing** approach: each turn, it builds a single text prompt containing the system instructions, agent identity file, a rolling conversation summary, and recent message history — all fitted within a configurable context budget (default ~20k tokens). The LLM responds with text that may contain `<tool_call>` XML blocks, which are parsed and executed locally. This loop continues until the model responds without tool calls or the turn limit is reached.
+In **dev mode** (default), the agent uses a prompt-stuffing approach: each turn, it builds a single text prompt containing the system instructions, agent identity file, a rolling conversation summary, and recent message history — all fitted within a configurable context budget (default ~20k tokens). The LLM responds with text that may contain `<tool_call>` XML blocks, which are parsed and executed locally. This loop continues until the model responds without tool calls or the turn limit is reached.
 
-Conversation state is checkpointed to `state/conversation_checkpoint.json` after each turn, allowing you to continue from the last checkpoint with the `-c` flag.
+In **long mode**, the agent uses the server's conversation memory. The first message includes the system prompt and tools; subsequent messages send only tool results or new user input. The server maintains the full conversation tree, so no client-side prompt building is needed. When the estimated context usage approaches 80% of the model's window, the agent recovers by summarizing the conversation and starting fresh.
+
+Conversation state is checkpointed to `state/conversation_checkpoint.json` after each turn, allowing you to continue from the last checkpoint with the `-c` flag. Long mode checkpoints include the server conversation ID, which is verified on resume.
