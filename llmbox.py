@@ -23,6 +23,13 @@ from llmbox_lib import Agent, NullCallbacks, TurnResult
 from tools import tools
 from tools.exec_command import cleanup_temp_sessions
 
+# Optional prompt_toolkit TUI
+try:
+    from tui import TuiSession, TuiCallbacks, show_context, show_tools
+    _HAS_TUI = True
+except ImportError:
+    _HAS_TUI = False
+
 DIM = "\033[90m"
 BOLD = "\033[1m"
 BLUE = "\033[34m"
@@ -397,8 +404,15 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
         from tools import load_extra_tools
         load_extra_tools(agent_tools_dir)
 
-    # Set up callbacks (needs agent reference)
-    cb = TerminalCallbacks(agent=agent, log=log, auto=auto)
+    # Set up TUI or plain terminal callbacks
+    use_tui = _HAS_TUI and not auto and sys.stdin.isatty()
+    tui_session = None
+
+    if use_tui:
+        tui_session = TuiSession(agent)
+        cb = TuiCallbacks(agent=agent, tui_session=tui_session, log=log, auto=auto)
+    else:
+        cb = TerminalCallbacks(agent=agent, log=log, auto=auto)
     agent.cb = cb
 
     mode_label = f" | Mode: {agent.mode}" if agent.mode != "dev" else ""
@@ -408,7 +422,10 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
     print(f"Model: {agent.model} | Max turns: {agent.max_turns}{mode_label}")
     print(f"Session log: {log_path}")
     print(f"Error log: {error_log_path}")
-    print("Press Escape twice to cancel")
+    if use_tui:
+        print("Ctrl+C to cancel | Ctrl+N for newline")
+    else:
+        print("Press Escape twice to cancel")
     print("Type /help for commands\n")
 
     # Health check
@@ -418,9 +435,9 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
     status.first_token()
     status.finish()
     if healthy:
-        print(f"  {DIM}[API healthy]{RESET}")
+        print(f"  {DIM}[API healthy]{RESET}\n")
     else:
-        print(f"  {BOLD}[WARNING: API health check failed]{RESET}")
+        print(f"  {BOLD}[WARNING: API health check failed]{RESET}\n")
 
     log.info("Session started | model=%s max_turns=%d mode=%s",
              agent.model, agent.max_turns, agent.mode)
@@ -534,9 +551,23 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
             return
 
     # ── Interactive loop ──
+    _interactive_loop(agent, log, tui_session)
+
+    cleanup_temp_sessions()
+    _delete_checkpoint()
+    log.info("Session ended | %d messages in history", len(agent.conversation_history))
+
+
+# ── Interactive loop ─────────────────────────────────────────────────
+
+def _interactive_loop(agent, log, tui_session=None):
+    """Main interactive input loop. Uses TuiSession if available, else raw input()."""
     while True:
         try:
-            user_input = input("\nYou: ").strip()
+            if tui_session:
+                user_input = tui_session.prompt()
+            else:
+                user_input = input("\nYou: ").strip()
         except EOFError:
             break
         except KeyboardInterrupt:
@@ -557,9 +588,16 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
             print(f"    /mode [dev|long]   Show or switch conversation mode")
             print(f"    /models            List available models")
             print(f"    /model <name>      Set model (or pick from menu)")
+            print(f"    /context           Show context usage")
+            print(f"    /verbose           Toggle verbose tool output")
+            print(f"    /tools             Show recent tool history")
             print(f"    @file              Attach file contents to prompt")
             print(f"    exit, quit         End session")
-            print(f"    Escape x2          Cancel current operation")
+            if tui_session:
+                print(f"    Ctrl+C             Cancel current operation")
+                print(f"    Ctrl+N             Insert newline")
+            else:
+                print(f"    Escape x2          Cancel current operation")
             print(f"\n  {BOLD}Modes:{RESET}")
             print(f"    dev                Prompt stuffing with rolling summary (default)")
             print(f"    long               Server-side conversation caching")
@@ -568,16 +606,19 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
         if user_input.strip().startswith("/mode"):
             parts = user_input.strip().split(None, 1)
             if len(parts) == 1:
-                print(f"  Mode: {BOLD}{agent.mode}{RESET}")
-                if agent.mode == "dev":
-                    print(f"    Messages: {len(agent.conversation_history)}")
-                    print(f"    Summary: {len(agent.summary_state.get('text', ''))} chars")
-                    print(f"    Context budget: {agent.max_context_chars:,} chars")
+                if tui_session:
+                    show_context(agent)
                 else:
-                    print(f"    Conversation: {agent.conversation_id or '(none)'}")
-                    limit = agent._get_context_limit_chars()
-                    print(f"    Approx usage: {agent.approx_char_usage:,} / {limit:,} chars "
-                          f"({agent.approx_char_usage * 100 // max(limit, 1)}%)")
+                    print(f"  Mode: {BOLD}{agent.mode}{RESET}")
+                    if agent.mode == "dev":
+                        print(f"    Messages: {len(agent.conversation_history)}")
+                        print(f"    Summary: {len(agent.summary_state.get('text', ''))} chars")
+                        print(f"    Context budget: {agent.max_context_chars:,} chars")
+                    else:
+                        print(f"    Conversation: {agent.conversation_id or '(none)'}")
+                        limit = agent._get_context_limit_chars()
+                        print(f"    Approx usage: {agent.approx_char_usage:,} / {limit:,} chars "
+                              f"({agent.approx_char_usage * 100 // max(limit, 1)}%)")
             else:
                 new_mode = parts[1].strip().lower()
                 if new_mode not in ("dev", "long"):
@@ -593,8 +634,33 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
         if user_input.strip() == "/clear":
             agent.reset()
             agent.initial_files = None
-            log, log_path, error_log_path = _setup_logger()
-            print(f"Conversation cleared. New session: {log_path}")
+            log, _, _ = _setup_logger()
+            print(f"Conversation cleared.")
+            continue
+
+        if user_input.strip() == "/context":
+            if _HAS_TUI:
+                show_context(agent)
+            else:
+                print(f"  Mode: {BOLD}{agent.mode}{RESET}")
+                print(f"  Messages: {len(agent.conversation_history)}")
+                print(f"  Summary: {len(agent.summary_state.get('text', ''))} chars")
+            continue
+
+        if user_input.strip() == "/verbose":
+            if tui_session:
+                tui_session.verbose = not tui_session.verbose
+                state = "on" if tui_session.verbose else "off"
+                print(f"  Verbose tool output: {BOLD}{state}{RESET}")
+            else:
+                print(f"  /verbose requires prompt_toolkit TUI")
+            continue
+
+        if user_input.strip() == "/tools":
+            if tui_session:
+                show_tools(tui_session)
+            else:
+                print(f"  /tools requires prompt_toolkit TUI")
             continue
 
         if user_input.strip() == "/models":
@@ -644,11 +710,10 @@ def run_agent_interactive(initial_prompt=None, auto=False, continue_mode=False,
             agent.initial_files = files
 
         log.info("USER: %s", expanded)
-        agent.run(expanded, auto=False)
-
-    cleanup_temp_sessions()
-    _delete_checkpoint()
-    log.info("Session ended | %d messages in history", len(agent.conversation_history))
+        try:
+            agent.run(expanded, auto=False)
+        except KeyboardInterrupt:
+            print(f"\n{BOLD}[Cancelled]{RESET}")
 
 
 # ── Entry point ──────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ echo
 
 # Install Python dependencies
 echo "Installing Python dependencies..."
-pip install --quiet requests markdownify PyMuPDF
+pip install --quiet requests markdownify PyMuPDF prompt_toolkit
 echo "  Done."
 
 # Make llmbox.sh executable
