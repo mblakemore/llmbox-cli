@@ -351,7 +351,7 @@ class Agent:
                       len(self.conversation_history))
 
         # Call LLM
-        self.cb.on_api_start("\nAssistant: ")
+        self.cb.on_api_start("\nThinking... ")
         try:
             msg = self.api.send_and_wait(prompt_str,
                                          cancel_check=self.cb.check_cancelled)
@@ -412,7 +412,7 @@ class Agent:
                       self.approx_char_usage // 1000)
 
         # Call LLM
-        self.cb.on_api_start("\nAssistant: ")
+        self.cb.on_api_start("\nThinking... ")
         try:
             msg, conv_id = self.api.send_and_wait_conv(
                 send_text, conversation_id=self.conversation_id,

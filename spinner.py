@@ -1,11 +1,12 @@
 """
 StreamStatus — visual feedback for model streaming.
 
-Phase 1 (waiting):   Braille spinner with elapsed time on the console line.
+Phase 1 (waiting):   Color-pulsing braille spinner with elapsed time.
 Phase 2 (streaming): Live token count + t/s in the terminal title bar.
 Phase 3 (done):      Dim summary line, terminal title reset.
 """
 
+import math
 import sys
 import threading
 import time
@@ -14,6 +15,19 @@ DIM = "\033[90m"
 RESET = "\033[0m"
 
 _BRAILLE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+# Pulse between UCSB navy and gold
+_COLOR_NAVY = (0, 54, 96)
+_COLOR_GOLD = (255, 209, 0)
+
+
+def _pulse_color(t):
+    """Return (r, g, b) for a smooth sine pulse: navy → gold → navy."""
+    frac = (math.sin(t * math.pi * 2) + 1) / 2  # 0..1
+    r = int(_COLOR_NAVY[0] + (_COLOR_GOLD[0] - _COLOR_NAVY[0]) * frac)
+    g = int(_COLOR_NAVY[1] + (_COLOR_GOLD[1] - _COLOR_NAVY[1]) * frac)
+    b = int(_COLOR_NAVY[2] + (_COLOR_GOLD[2] - _COLOR_NAVY[2]) * frac)
+    return r, g, b
 
 
 class StreamStatus:
@@ -47,10 +61,14 @@ class StreamStatus:
 
     def _spin(self):
         i = 0
+        cycle_duration = 2.0
         while not self._stop.is_set():
             elapsed = time.monotonic() - self._start_time
             frame = _BRAILLE[i % len(_BRAILLE)]
-            sys.stdout.write(f"\r\033[K{self._prefix}{frame} {elapsed:.1f}s")
+            t = elapsed / cycle_duration
+            r, g, b = _pulse_color(t)
+            color = f"\033[38;2;{r};{g};{b}m"
+            sys.stdout.write(f"\r\033[K{self._prefix}{color}{frame}\033[0m {elapsed:.1f}s")
             sys.stdout.flush()
             i += 1
             self._stop.wait(0.1)

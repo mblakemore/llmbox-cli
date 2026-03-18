@@ -226,7 +226,7 @@ class TuiCallbacks(NullCallbacks):
         if reasoning:
             _print(f"{BLUE}[Reasoning]\n{reasoning}{RESET}\n")
         if text:
-            _print(text)
+            _print(f"\nAssistant: {text}")
 
     def on_tool_batch_start(self, count):
         if self.tui.verbose:

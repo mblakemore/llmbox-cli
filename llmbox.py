@@ -313,7 +313,7 @@ class TerminalCallbacks(NullCallbacks):
         if reasoning:
             print(f"{BLUE}[Reasoning]\n{reasoning}{RESET}\n")
         if text:
-            print(text)
+            print(f"\nAssistant: {text}")
 
     def on_tool_batch_start(self, count):
         # Enter cancellable mode for tool execution
