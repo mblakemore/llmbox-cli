@@ -605,7 +605,7 @@ def _interactive_loop(agent, log, tui_session=None):
             print(f"    long               Server-side conversation caching")
             continue
 
-        if user_input.strip().startswith("/mode"):
+        if user_input.strip() == "/mode" or user_input.strip().startswith("/mode "):
             parts = user_input.strip().split(None, 1)
             if len(parts) == 1:
                 if tui_session:

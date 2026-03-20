@@ -5,6 +5,10 @@ Exposes an Anthropic-compatible /v1/messages endpoint that translates
 requests to the UCSB LLM Sandbox Bot API format, enabling Claude Code
 to use Sandbox-hosted models.
 
+Tool use is supported by injecting tool definitions into the system prompt
+and parsing XML tool_call blocks from the model's text output, converting
+them to Anthropic-format tool_use content blocks.
+
 Usage:
     BEDROCK_API_URL=https://... BEDROCK_API_KEY=... uvicorn cc_gateway:app --port 8781
 
@@ -17,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 import logging
@@ -51,15 +56,17 @@ BOT_HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
 # Model mapping: Anthropic API names → Sandbox names
 # ---------------------------------------------------------------------------
 MODEL_MAP = {
-    "claude-opus-4-6": "claude-v4.6-opus",
+    # 4.6 models not yet on Sandbox — fall back to 4.5 equivalents
+    "claude-opus-4-6": "claude-v4.5-opus",
+    "claude-opus-4-6-20250612": "claude-v4.5-opus",
+    "claude-sonnet-4-6": "claude-v4.5-sonnet",
+    "claude-sonnet-4-6-20250514": "claude-v4.5-sonnet",
+    # 4.5 models
     "claude-opus-4-5": "claude-v4.5-opus",
     "claude-sonnet-4-5": "claude-v4.5-sonnet",
     "claude-sonnet-4-5-20250514": "claude-v4.5-sonnet",
     "claude-haiku-4-5": "claude-v4.5-haiku",
     "claude-haiku-4-5-20251001": "claude-v4.5-haiku",
-    "claude-opus-4-6-20250612": "claude-v4.6-opus",
-    "claude-sonnet-4-6": "claude-v4.6-sonnet",
-    "claude-sonnet-4-6-20250514": "claude-v4.6-sonnet",
 }
 
 
@@ -105,6 +112,8 @@ class MessagesRequest(BaseModel):
     top_p: Optional[float] = None
     stop_sequences: Optional[List[str]] = None
     metadata: Optional[dict] = None
+    tools: Optional[List[dict]] = None
+    tool_choice: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +121,90 @@ class MessagesRequest(BaseModel):
 # ---------------------------------------------------------------------------
 CHARS_PER_TOKEN = 4
 
+# Regex to extract tool_call XML blocks from model text output
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
 
 def estimate_tokens(text: str) -> int:
     return max(len(text) // CHARS_PER_TOKEN, 1)
+
+
+def format_tools_for_prompt(tools: List[dict]) -> str:
+    """Convert Anthropic tool definitions to text for system prompt injection."""
+    if not tools:
+        return ""
+
+    lines = ["\n\nAVAILABLE TOOLS:"]
+    for tool in tools:
+        name = tool.get("name", "")
+        desc = tool.get("description", "")
+        schema = tool.get("input_schema", {})
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+
+        param_lines = []
+        for pname, pinfo in props.items():
+            req_str = " (required)" if pname in required else ""
+            ptype = pinfo.get("type", "string")
+            pdesc = pinfo.get("description", "")
+            if pinfo.get("enum"):
+                pdesc += f" One of: {pinfo['enum']}"
+            param_lines.append(f"    - {pname} ({ptype}{req_str}): {pdesc}")
+
+        params_str = "\n".join(param_lines) if param_lines else "    (no parameters)"
+        lines.append(f"  {name}: {desc}\n  Parameters:\n{params_str}")
+
+    lines.append("""
+TO USE A TOOL, include a tool call block in your response:
+
+<tool_call>
+{"tool": "tool_name", "args": {"param1": "value1", "param2": "value2"}}
+</tool_call>
+
+RULES:
+- You may use multiple tool calls in a single response.
+- After tool execution, you will receive results and can continue.
+- When you need to use a tool, ALWAYS use the <tool_call> format above.
+- Do not fabricate tool results — wait for actual execution.
+- IMPORTANT: When a task is complete, respond with plain text (NO tool_call blocks). Do NOT repeat tool calls that have already succeeded. If a tool result shows success, move on — do not call the same tool again.""")
+
+    return "\n".join(lines)
+
+
+def parse_tool_calls(text: str) -> List[dict]:
+    """Extract tool_call XML blocks from model text and return as Anthropic tool_use dicts."""
+    calls = []
+    for match in _TOOL_CALL_RE.finditer(text):
+        try:
+            data = json.loads(match.group(1))
+            name = data.get("tool") or data.get("name")
+            args = data.get("args") or data.get("arguments") or data.get("input") or {}
+            # Fallback: remaining keys as args
+            if not args and name:
+                args = {k: v for k, v in data.items() if k not in ("tool", "name", "arguments", "input")}
+            if name:
+                calls.append({
+                    "type": "tool_use",
+                    "id": f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": name,
+                    "input": args,
+                })
+        except json.JSONDecodeError:
+            continue
+    return calls
+
+
+def strip_tool_calls(text: str) -> str:
+    """Remove tool_call XML blocks from text."""
+    return _TOOL_CALL_RE.sub("", text).strip()
+
+
+def _get_block_dict(block) -> dict:
+    """Normalize a content block to a plain dict."""
+    if isinstance(block, dict):
+        return block
+    # Pydantic model or similar
+    return block.model_dump() if hasattr(block, "model_dump") else block.__dict__
 
 
 def assemble_content(req: MessagesRequest) -> List[dict]:
@@ -122,19 +212,26 @@ def assemble_content(req: MessagesRequest) -> List[dict]:
     content_blocks = []
 
     # System prompt
+    system_text = ""
     if req.system:
         if isinstance(req.system, str):
-            content_blocks.append({
-                "contentType": "text",
-                "body": f"System instructions: {req.system}",
-            })
+            system_text = req.system
         elif isinstance(req.system, list):
+            parts = []
             for block in req.system:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    content_blocks.append({
-                        "contentType": "text",
-                        "body": f"System instructions: {block.get('text', '')}",
-                    })
+                    parts.append(block.get("text", ""))
+            system_text = "\n".join(parts)
+
+    # Inject tool definitions into system prompt
+    if req.tools:
+        system_text += format_tools_for_prompt(req.tools)
+
+    if system_text:
+        content_blocks.append({
+            "contentType": "text",
+            "body": f"System instructions: {system_text}",
+        })
 
     # Messages
     for msg in req.messages:
@@ -148,25 +245,58 @@ def assemble_content(req: MessagesRequest) -> List[dict]:
             })
         elif isinstance(content, list):
             for block in content:
-                if isinstance(block, dict):
-                    block_type = block.get("type", "")
-                else:
-                    block_type = block.type
+                b = _get_block_dict(block)
+                block_type = b.get("type", "")
 
                 if block_type == "text":
-                    text = block.get("text", "") if isinstance(block, dict) else (block.text or "")
-                    content_blocks.append({
-                        "contentType": "text",
-                        "body": f"{role_prefix}: {text}",
-                    })
+                    text = b.get("text", "")
+                    if text:
+                        content_blocks.append({
+                            "contentType": "text",
+                            "body": f"{role_prefix}: {text}",
+                        })
+
                 elif block_type == "image":
-                    source = block.get("source", {}) if isinstance(block, dict) else (block.source or {})
+                    source = b.get("source", {})
                     if source.get("type") == "base64":
                         content_blocks.append({
                             "contentType": "image",
                             "mediaType": source.get("media_type", "image/png"),
                             "body": source.get("data", ""),
                         })
+
+                elif block_type == "tool_use":
+                    # Assistant's tool call — include as text so model sees what it did
+                    name = b.get("name", "")
+                    input_data = b.get("input", {})
+                    content_blocks.append({
+                        "contentType": "text",
+                        "body": (
+                            f"Assistant: <tool_call>\n"
+                            f'{json.dumps({"tool": name, "args": input_data})}\n'
+                            f"</tool_call>"
+                        ),
+                    })
+
+                elif block_type == "tool_result":
+                    # User's tool result — format as labeled text
+                    tool_use_id = b.get("tool_use_id", "")
+                    is_error = b.get("is_error", False)
+                    result_content = b.get("content", "")
+
+                    # content can be string or list of blocks
+                    if isinstance(result_content, list):
+                        parts = []
+                        for rb in result_content:
+                            if isinstance(rb, dict) and rb.get("type") == "text":
+                                parts.append(rb.get("text", ""))
+                        result_content = "\n".join(parts)
+
+                    label = "Tool error" if is_error else "Tool result"
+                    content_blocks.append({
+                        "contentType": "text",
+                        "body": f"User: [{label} for {tool_use_id}]: {result_content}",
+                    })
 
     return content_blocks
 
@@ -261,39 +391,76 @@ def call_sandbox(req: MessagesRequest) -> Tuple[str, str, str]:
         },
     }
 
+    log.debug("Payload: %s", json.dumps(payload, default=str)[:2000])
+
     post_resp = requests.post(
         f"{API_URL}/conversation", headers=BOT_HEADERS, json=payload
     )
+    if post_resp.status_code != 200:
+        log.error("Sandbox returned %d: %s", post_resp.status_code, post_resp.text[:500])
     post_resp.raise_for_status()
     resp_data = post_resp.json()
     message_id = resp_data.get("messageId")
     conv_id = resp_data.get("conversationId")
 
     reply, stop_reason = poll_for_reply(conv_id, message_id)
+
+    # Log tool call detection
+    if req.tools:
+        tool_calls = parse_tool_calls(reply)
+        if tool_calls:
+            names = [tc["name"] for tc in tool_calls]
+            log.info("Detected %d tool call(s): %s", len(tool_calls), ", ".join(names))
+
     return reply, sandbox_model, stop_reason
 
 
 # ---------------------------------------------------------------------------
-# Build Anthropic-format responses
+# Build Anthropic-format responses (with tool_use support)
 # ---------------------------------------------------------------------------
-def build_message_response(reply: str, model: str, stop_reason: str, req: MessagesRequest) -> dict:
-    """Build an Anthropic Messages API response."""
+def _estimate_input_tokens(req: MessagesRequest) -> int:
     input_text = ""
     if req.system:
         input_text += str(req.system)
     for m in req.messages:
         input_text += str(m.content)
+    return estimate_tokens(input_text)
+
+
+def _build_content_blocks(reply: str, has_tools: bool) -> Tuple[List[dict], str]:
+    """Parse reply into Anthropic content blocks. Returns (content, stop_reason)."""
+    if not has_tools:
+        return [{"type": "text", "text": reply}], "end_turn"
+
+    tool_calls = parse_tool_calls(reply)
+    if not tool_calls:
+        return [{"type": "text", "text": reply}], "end_turn"
+
+    # Build content: text (if any) + tool_use blocks
+    content = []
+    clean_text = strip_tool_calls(reply)
+    if clean_text:
+        content.append({"type": "text", "text": clean_text})
+    content.extend(tool_calls)
+
+    return content, "tool_use"
+
+
+def build_message_response(reply: str, model: str, stop_reason: str, req: MessagesRequest) -> dict:
+    """Build an Anthropic Messages API response."""
+    has_tools = bool(req.tools)
+    content, actual_stop = _build_content_blocks(reply, has_tools)
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": reply}],
+        "content": content,
         "model": model,
-        "stop_reason": stop_reason,
+        "stop_reason": actual_stop,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": estimate_tokens(input_text),
+            "input_tokens": _estimate_input_tokens(req),
             "output_tokens": estimate_tokens(reply),
         },
     }
@@ -302,32 +469,44 @@ def build_message_response(reply: str, model: str, stop_reason: str, req: Messag
 def build_streaming_response(reply: str, model: str, stop_reason: str, req: MessagesRequest):
     """Yield SSE events in Anthropic streaming format."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    has_tools = bool(req.tools)
+    content_blocks, actual_stop = _build_content_blocks(reply, has_tools)
 
-    input_text = ""
-    if req.system:
-        input_text += str(req.system)
-    for m in req.messages:
-        input_text += str(m.content)
-    input_tokens = estimate_tokens(input_text)
+    input_tokens = _estimate_input_tokens(req)
     output_tokens = estimate_tokens(reply)
 
     # message_start
     yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': input_tokens, 'output_tokens': 0}}})}\n\n"
 
-    # content_block_start
-    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+    # Emit each content block
+    for idx, block in enumerate(content_blocks):
+        if block["type"] == "text":
+            # content_block_start (text)
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
 
-    # Stream the reply in chunks for a more natural feel
-    chunk_size = 20  # characters per chunk
-    for i in range(0, len(reply), chunk_size):
-        chunk = reply[i:i + chunk_size]
-        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': chunk}})}\n\n"
+            # Stream text in chunks
+            text = block["text"]
+            chunk_size = 20
+            for i in range(0, len(text), chunk_size):
+                chunk = text[i:i + chunk_size]
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'text_delta', 'text': chunk}})}\n\n"
 
-    # content_block_stop
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+            # content_block_stop
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+
+        elif block["type"] == "tool_use":
+            # content_block_start (tool_use)
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': idx, 'content_block': {'type': 'tool_use', 'id': block['id'], 'name': block['name'], 'input': {}}})}\n\n"
+
+            # Stream the input JSON as a single delta
+            input_json = json.dumps(block["input"])
+            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': idx, 'delta': {'type': 'input_json_delta', 'partial_json': input_json}})}\n\n"
+
+            # content_block_stop
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
 
     # message_delta
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': actual_stop, 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
 
     # message_stop
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
