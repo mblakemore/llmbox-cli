@@ -16,7 +16,9 @@ _DEFAULT_CONFIG = {
     "api_key": os.environ.get("BEDROCK_API_KEY", ""),
     "origin": "http://localhost:8000",
     "model": "claude-v4.5-sonnet",
-    "poll_interval": 2,
+    "poll_interval": 0.3,
+    "poll_backoff": 1.5,
+    "poll_max_interval": 5.0,
     "poll_timeout": 180,
 }
 
@@ -28,7 +30,9 @@ class BedrockChatAPI:
         cfg = {**_DEFAULT_CONFIG, **(config or {})}
         self.api_url = cfg["api_url"]
         self.model = cfg["model"]
-        self.poll_interval = cfg["poll_interval"]
+        self.poll_initial = cfg["poll_interval"]
+        self.poll_backoff = cfg.get("poll_backoff", 1.5)
+        self.poll_max_interval = cfg.get("poll_max_interval", 5.0)
         self.poll_timeout = cfg["poll_timeout"]
         self.session = requests.Session()
         self.session.headers.update({
@@ -68,14 +72,18 @@ class BedrockChatAPI:
         return data["conversationId"], data["messageId"]
 
     def poll(self, conversation_id: str, cancel_check=None) -> dict:
-        """Poll until assistant response is ready. Returns the assistant message dict."""
+        """Poll until assistant response is ready. Uses adaptive exponential backoff."""
         deadline = time.time() + self.poll_timeout
+        interval = self.poll_initial
         while time.time() < deadline:
-            time.sleep(self.poll_interval)
+            time.sleep(interval)
             if cancel_check:
                 cancel_check()
             resp = self.session.get(
                 f"{self.api_url}/conversation/{conversation_id}", timeout=30)
+            if resp.status_code == 429:
+                interval = self.poll_max_interval
+                continue
             resp.raise_for_status()
             conv = resp.json()
             last_id = conv.get("lastMessageId")
@@ -83,30 +91,37 @@ class BedrockChatAPI:
                 last_msg = conv.get("messageMap", {}).get(last_id, {})
                 if last_msg.get("role") == "assistant":
                     return last_msg
+            interval = min(interval * self.poll_backoff, self.poll_max_interval)
         raise TimeoutError(f"No response after {self.poll_timeout}s")
 
     def poll_message(self, conversation_id: str, message_id: str,
                      cancel_check=None) -> dict:
         """Poll a specific message until the assistant response is ready.
 
-        Uses GET /conversation/{conv_id}/{msg_id} which returns the assistant's
-        response to a specific user message. Returns 404 while processing.
+        Uses GET /conversation/{conv_id}/{msg_id} with adaptive exponential backoff.
+        Returns 404 while processing.
         """
         deadline = time.time() + self.poll_timeout
+        interval = self.poll_initial
         while time.time() < deadline:
-            time.sleep(self.poll_interval)
+            time.sleep(interval)
             if cancel_check:
                 cancel_check()
             resp = self.session.get(
                 f"{self.api_url}/conversation/{conversation_id}/{message_id}",
                 timeout=30)
             if resp.status_code == 404:
+                interval = min(interval * self.poll_backoff, self.poll_max_interval)
                 continue  # not ready yet
+            if resp.status_code == 429:
+                interval = self.poll_max_interval
+                continue
             resp.raise_for_status()
             data = resp.json()
             msg = data.get("message", {})
             if msg.get("role") == "assistant":
                 return msg
+            interval = min(interval * self.poll_backoff, self.poll_max_interval)
         raise TimeoutError(f"No response after {self.poll_timeout}s")
 
     def get_conversation(self, conversation_id: str) -> dict:

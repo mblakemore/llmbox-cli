@@ -46,7 +46,9 @@ _DEFAULT_CONFIG = {
         "api_key": os.environ.get("BEDROCK_API_KEY", ""),
         "origin": "http://localhost:8000",
         "model": "claude-v4.5-sonnet",
-        "poll_interval": 2,
+        "poll_interval": 0.3,
+        "poll_backoff": 1.5,
+        "poll_max_interval": 5.0,
         "poll_timeout": 180,
     },
     "context": {
