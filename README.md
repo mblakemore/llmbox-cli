@@ -101,9 +101,9 @@ Place an `agent.md` file in the working directory to provide the agent with pers
 | `file` | Read, write, append, delete, and list files. Enforces read-before-write. |
 | `exec_command` | Run shell commands with timeout, background execution, and session management. |
 | `search_files` | Regex search across files (like grep). |
-| `web_fetch` | Fetch web pages, convert to markdown, save to `state/fetched/`. |
+| `web_fetch` | Fetch web pages, convert to markdown, save to `.llmbox/state/fetched/`. |
 | `think` | Separate reasoning API call with chain-of-thought enabled. |
-| `task_tracker` | Persistent task management stored in `state/tasks.json`. |
+| `task_tracker` | Persistent task management stored in `.llmbox/state/tasks.json`. |
 | `read_pdf` | Extract text from PDF files with page range support. |
 | `sleep` | Pause execution for a specified duration. |
 
@@ -131,6 +131,19 @@ The agent supports two conversation modes, selectable via `--mode` or `/mode`:
 **long mode** uses the server's conversation memory. The server retains all messages exactly, giving perfect recall of earlier turns. When the context window fills up, it recovers by summarizing and starting a new conversation (or switching to dev mode).
 
 Switch modes mid-session with `/mode dev` or `/mode long`. Use `/mode` to see current stats.
+
+## Claude Code gateway
+
+`cc_gateway.py` is a local proxy that lets [Claude Code](https://docs.anthropic.com/en/docs/claude-code) use Sandbox-hosted models by translating the Anthropic Messages API into Sandbox Bot API calls. See [docs/cc_gateway.md](docs/cc_gateway.md) for setup instructions.
+
+```bash
+# Start the gateway
+uvicorn cc_gateway:app --port 8781
+
+# Point Claude Code at it
+export ANTHROPIC_BASE_URL=http://localhost:8781
+export ANTHROPIC_API_KEY=not-needed
+```
 
 ## Library usage
 
