@@ -182,6 +182,86 @@ def parse_tool_calls(text: str) -> List[dict]:
     return calls
 
 
+# ---------------------------------------------------------------------------
+# Tool call validation
+# ---------------------------------------------------------------------------
+def _build_tool_index(tools: List[dict]) -> dict:
+    """Build name → input_schema map from the request's tool definitions."""
+    index = {}
+    for tool in tools:
+        name = tool.get("name", "")
+        if name:
+            index[name] = tool.get("input_schema", {})
+    return index
+
+
+def _validate_args(args: dict, schema: dict) -> List[str]:
+    """Validate tool call args against its input_schema. Returns list of errors."""
+    errors = []
+    props = schema.get("properties", {})
+    required = schema.get("required", [])
+
+    # Check required params are present
+    for req_param in required:
+        if req_param not in args:
+            errors.append(f"missing required param '{req_param}'")
+
+    # Check no unknown params (only if schema defines properties)
+    if props:
+        for key in args:
+            if key not in props:
+                errors.append(f"unknown param '{key}'")
+
+    # Check basic type conformance for present params
+    type_map = {"string": str, "integer": int, "number": (int, float),
+                "boolean": bool, "array": list, "object": dict}
+    for key, value in args.items():
+        if key not in props:
+            continue
+        expected_type = props[key].get("type")
+        if expected_type and expected_type in type_map:
+            if not isinstance(value, type_map[expected_type]):
+                # Allow int where number expected
+                if expected_type == "number" and isinstance(value, (int, float)):
+                    continue
+                errors.append(f"param '{key}' expected {expected_type}, got {type(value).__name__}")
+
+    return errors
+
+
+def validate_tool_calls(tool_calls: List[dict], tools: List[dict]) -> List[dict]:
+    """Validate and filter tool calls. Returns only valid calls, logs rejections."""
+    if not tools:
+        return tool_calls
+
+    index = _build_tool_index(tools)
+    valid = []
+
+    for tc in tool_calls:
+        name = tc["name"]
+
+        # Allowlist check
+        if name not in index:
+            log.warning("REJECTED tool call: '%s' not in allowlist (%d tools)",
+                        name, len(index))
+            continue
+
+        # Schema validation
+        schema = index[name]
+        errors = _validate_args(tc["input"], schema)
+        if errors:
+            log.warning("REJECTED tool call: %s — %s", name, "; ".join(errors))
+            continue
+
+        valid.append(tc)
+
+    rejected = len(tool_calls) - len(valid)
+    if rejected:
+        log.info("Validated tool calls: %d passed, %d rejected", len(valid), rejected)
+
+    return valid
+
+
 def strip_tool_calls(text: str) -> str:
     """Remove tool_call XML blocks from text."""
     return _TOOL_CALL_RE.sub("", text).strip()
@@ -449,13 +529,19 @@ def _estimate_input_tokens(req: MessagesRequest) -> int:
     return estimate_tokens(input_text)
 
 
-def _build_content_blocks(reply: str, has_tools: bool) -> Tuple[List[dict], str]:
+def _build_content_blocks(reply: str, tools: Optional[List[dict]]) -> Tuple[List[dict], str]:
     """Parse reply into Anthropic content blocks. Returns (content, stop_reason)."""
-    if not has_tools:
+    if not tools:
         return [{"type": "text", "text": reply}], "end_turn"
 
     tool_calls = parse_tool_calls(reply)
     if not tool_calls:
+        return [{"type": "text", "text": reply}], "end_turn"
+
+    # Validate: allowlist + schema check
+    tool_calls = validate_tool_calls(tool_calls, tools)
+    if not tool_calls:
+        # All calls rejected — return as plain text so model sees what it tried
         return [{"type": "text", "text": reply}], "end_turn"
 
     # Build content: text (if any) + tool_use blocks
@@ -470,8 +556,7 @@ def _build_content_blocks(reply: str, has_tools: bool) -> Tuple[List[dict], str]
 
 def build_message_response(reply: str, model: str, stop_reason: str, req: MessagesRequest) -> dict:
     """Build an Anthropic Messages API response."""
-    has_tools = bool(req.tools)
-    content, actual_stop = _build_content_blocks(reply, has_tools)
+    content, actual_stop = _build_content_blocks(reply, req.tools)
 
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -491,8 +576,7 @@ def build_message_response(reply: str, model: str, stop_reason: str, req: Messag
 def build_streaming_response(reply: str, model: str, stop_reason: str, req: MessagesRequest):
     """Yield SSE events in Anthropic streaming format."""
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    has_tools = bool(req.tools)
-    content_blocks, actual_stop = _build_content_blocks(reply, has_tools)
+    content_blocks, actual_stop = _build_content_blocks(reply, req.tools)
 
     input_tokens = _estimate_input_tokens(req)
     output_tokens = estimate_tokens(reply)
