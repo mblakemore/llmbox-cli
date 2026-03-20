@@ -33,7 +33,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO)
+_log_level = os.environ.get("CC_GATEWAY_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _log_level, logging.INFO))
 log = logging.getLogger("cc-gateway")
 
 # ---------------------------------------------------------------------------
@@ -90,16 +91,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Anthropic-compatible request model
 # ---------------------------------------------------------------------------
-class ContentBlock(BaseModel):
-    type: str
-    text: Optional[str] = None
-    # image support
-    source: Optional[dict] = None
-
-
 class AnthropicMessage(BaseModel):
     role: str
-    content: Union[str, List[ContentBlock], List[dict]]
+    content: Union[str, List[dict]]
 
 
 class MessagesRequest(BaseModel):
@@ -211,6 +205,15 @@ def assemble_content(req: MessagesRequest) -> List[dict]:
     """Flatten Anthropic messages into Sandbox content blocks with role prefixes."""
     content_blocks = []
 
+    # Build tool_use_id → tool_name map for resolving tool results
+    tool_id_to_name: dict[str, str] = {}
+    for msg in req.messages:
+        if isinstance(msg.content, list):
+            for block in msg.content:
+                b = _get_block_dict(block)
+                if b.get("type") == "tool_use":
+                    tool_id_to_name[b.get("id", "")] = b.get("name", "unknown")
+
     # System prompt
     system_text = ""
     if req.system:
@@ -272,17 +275,19 @@ def assemble_content(req: MessagesRequest) -> List[dict]:
                     content_blocks.append({
                         "contentType": "text",
                         "body": (
-                            f"Assistant: <tool_call>\n"
+                            f"Assistant: I used the {name} tool:\n"
+                            f"<tool_call>\n"
                             f'{json.dumps({"tool": name, "args": input_data})}\n'
                             f"</tool_call>"
                         ),
                     })
 
                 elif block_type == "tool_result":
-                    # User's tool result — format as labeled text
+                    # User's tool result — format with tool name for clarity
                     tool_use_id = b.get("tool_use_id", "")
                     is_error = b.get("is_error", False)
                     result_content = b.get("content", "")
+                    tool_name = tool_id_to_name.get(tool_use_id, "unknown")
 
                     # content can be string or list of blocks
                     if isinstance(result_content, list):
@@ -292,11 +297,19 @@ def assemble_content(req: MessagesRequest) -> List[dict]:
                                 parts.append(rb.get("text", ""))
                         result_content = "\n".join(parts)
 
-                    label = "Tool error" if is_error else "Tool result"
+                    if is_error:
+                        label = f"Tool ERROR from {tool_name}"
+                    else:
+                        label = f"Tool result from {tool_name} (success)"
                     content_blocks.append({
                         "contentType": "text",
-                        "body": f"User: [{label} for {tool_use_id}]: {result_content}",
+                        "body": f"User: [{label}]: {result_content}",
                     })
+
+    log.debug("Assembled %d content blocks for Sandbox", len(content_blocks))
+    for i, cb in enumerate(content_blocks):
+        body_preview = cb.get("body", "")[:200]
+        log.debug("  Block %d [%s]: %s", i, cb.get("contentType"), body_preview)
 
     return content_blocks
 
@@ -380,7 +393,17 @@ def call_sandbox(req: MessagesRequest) -> Tuple[str, str, str]:
     sandbox_model = resolve_model(req.model)
     content_blocks = assemble_content(req)
 
-    log.info("Sending to Sandbox: model=%s, %d content blocks", sandbox_model, len(content_blocks))
+    log.info("Sending to Sandbox: model=%s, %d content blocks, tools=%s",
+             sandbox_model, len(content_blocks),
+             len(req.tools) if req.tools else 0)
+
+    # Log incoming message structure for debugging
+    for i, msg in enumerate(req.messages):
+        if isinstance(msg.content, list):
+            types = [_get_block_dict(b).get("type", "?") for b in msg.content]
+            log.debug("  Message %d [%s]: %s", i, msg.role, types)
+        else:
+            log.debug("  Message %d [%s]: text(%d chars)", i, msg.role, len(str(msg.content)))
 
     payload = {
         "message": {
@@ -405,12 +428,17 @@ def call_sandbox(req: MessagesRequest) -> Tuple[str, str, str]:
 
     reply, stop_reason = poll_for_reply(conv_id, message_id)
 
-    # Log tool call detection
+    # Log reply and tool call detection
+    log.debug("Raw reply (%d chars): %s", len(reply), reply[:500])
     if req.tools:
         tool_calls = parse_tool_calls(reply)
         if tool_calls:
-            names = [tc["name"] for tc in tool_calls]
-            log.info("Detected %d tool call(s): %s", len(tool_calls), ", ".join(names))
+            for tc in tool_calls:
+                log.info("Detected tool call: %s(%s)",
+                         tc["name"],
+                         ", ".join(f"{k}={str(v)[:50]}" for k, v in tc["input"].items()))
+        else:
+            log.info("No tool calls detected in reply")
 
     return reply, sandbox_model, stop_reason
 
