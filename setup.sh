@@ -4,17 +4,34 @@ set -e
 echo "=== llmbox setup ==="
 echo
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+
+# Create virtual environment
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Creating virtual environment..."
+    python3 -m venv "$VENV_DIR"
+    echo "  Created .venv/"
+else
+    echo "Virtual environment already exists."
+fi
+
 # Install Python dependencies
 echo "Installing Python dependencies..."
-pip install --quiet requests markdownify PyMuPDF prompt_toolkit
+"$VENV_DIR/bin/pip" install --quiet --upgrade pip
+"$VENV_DIR/bin/pip" install --quiet requests markdownify PyMuPDF prompt_toolkit
+echo "  Done."
+
+# Install gateway dependencies (optional, for cc_gateway.py)
+echo "Installing gateway dependencies..."
+"$VENV_DIR/bin/pip" install --quiet fastapi uvicorn
 echo "  Done."
 
 # Make llmbox.sh executable
-chmod +x "$(dirname "$0")/llmbox.sh"
+chmod +x "$SCRIPT_DIR/llmbox.sh"
 
 # Symlink to ~/.local/bin
 mkdir -p ~/.local/bin
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ln -sf "$SCRIPT_DIR/llmbox.sh" ~/.local/bin/llmbox
 echo "  Installed 'llmbox' command to ~/.local/bin/llmbox"
 

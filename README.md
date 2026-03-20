@@ -13,9 +13,10 @@ cd llmbox-cli
 ```
 
 The setup script will:
-1. Install Python dependencies (`requests`, `markdownify`, `PyMuPDF`, `prompt_toolkit`)
-2. Add the `llmbox` command to your PATH
-3. Prompt for your API URL and key (saved to your shell profile)
+1. Create a Python virtual environment (`.venv/`)
+2. Install dependencies (`requests`, `markdownify`, `PyMuPDF`, `prompt_toolkit`, `fastapi`, `uvicorn`)
+3. Add the `llmbox` command to your PATH
+4. Prompt for your API URL and key (saved to your shell profile)
 
 Then start it from any directory:
 
@@ -28,7 +29,9 @@ llmbox
 If you prefer to set things up yourself:
 
 ```bash
-pip install requests markdownify PyMuPDF prompt_toolkit
+python3 -m venv .venv
+source .venv/bin/activate
+pip install requests markdownify PyMuPDF prompt_toolkit fastapi uvicorn
 export BEDROCK_API_URL="https://your-api-gateway-url"
 export BEDROCK_API_KEY="your-api-key"
 python llmbox.py

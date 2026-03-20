@@ -18,7 +18,10 @@ Claude Code  ──POST /v1/messages──▶  cc_gateway.py  ──POST /conver
 
 ## Prerequisites
 
+If you ran `./setup.sh`, all dependencies are already installed in the `.venv/` virtual environment. Otherwise:
+
 ```bash
+source .venv/bin/activate  # or: python3 -m venv .venv && source .venv/bin/activate
 pip install fastapi uvicorn requests
 ```
 
@@ -33,13 +36,17 @@ If you've already run `./setup.sh` for llmbox, these should be in your shell pro
 ### 1. Start the gateway
 
 ```bash
+# If you used setup.sh (venv is automatic):
+.venv/bin/uvicorn cc_gateway:app --port 8781
+
+# Or if your venv is activated:
 uvicorn cc_gateway:app --port 8781
 ```
 
 Or with explicit credentials:
 
 ```bash
-BEDROCK_API_URL=https://your-sandbox-url BEDROCK_API_KEY=your-key uvicorn cc_gateway:app --port 8781
+BEDROCK_API_URL=https://your-sandbox-url BEDROCK_API_KEY=your-key .venv/bin/uvicorn cc_gateway:app --port 8781
 ```
 
 ### 2. Configure Claude Code
