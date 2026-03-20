@@ -658,3 +658,22 @@ def root():
         "docs": "/docs",
         "usage": "export ANTHROPIC_BASE_URL=http://localhost:8781",
     }
+
+
+if __name__ == "__main__":
+    import signal
+    import uvicorn
+
+    def signal_handler(sig, frame):
+        log.info("Shutdown signal received")
+        exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8781,
+        log_level=_log_level.lower(),
+    )
