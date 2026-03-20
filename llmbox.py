@@ -142,7 +142,7 @@ def _expand_file_refs(text):
 # ── Logger setup ──────────────────────────────────────────────────────
 
 def _setup_logger():
-    history_dir = os.path.join(os.getcwd(), ".history")
+    history_dir = os.path.join(os.getcwd(), ".llmbox", "history")
     os.makedirs(history_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -175,7 +175,7 @@ def _setup_logger():
 
 # ── Conversation checkpoints ──────────────────────────────────────────
 
-_CHECKPOINT_PATH = os.path.join(os.getcwd(), "state", "conversation_checkpoint.json")
+_CHECKPOINT_PATH = os.path.join(os.getcwd(), ".llmbox", "state", "conversation_checkpoint.json")
 
 
 def _save_checkpoint(agent, turn=0):
@@ -219,7 +219,7 @@ def _delete_checkpoint():
 # ── Cycle auto-increment ─────────────────────────────────────────────
 
 def _auto_increment_cycle(log):
-    state_path = os.path.join(os.getcwd(), "state", "current-state.json")
+    state_path = os.path.join(os.getcwd(), ".llmbox", "state", "current-state.json")
     if not os.path.exists(state_path):
         return
 
@@ -255,7 +255,7 @@ def _auto_increment_cycle(log):
                 json.dump(state, f, indent=2)
                 f.write("\n")
 
-            focus_path = os.path.join(os.getcwd(), "state", "focus.json")
+            focus_path = os.path.join(os.getcwd(), ".llmbox", "state", "focus.json")
             if os.path.exists(focus_path):
                 try:
                     with open(focus_path) as f:

@@ -3,8 +3,7 @@ __pycache__/
 *.pyo
 
 # Runtime state
-.history/
-state/
+.llmbox/
 
 # Config may contain API keys
 config.json
