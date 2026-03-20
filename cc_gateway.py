@@ -42,7 +42,7 @@ log = logging.getLogger("cc-gateway")
 # ---------------------------------------------------------------------------
 API_URL = os.environ.get("BEDROCK_API_URL")
 API_KEY = os.environ.get("BEDROCK_API_KEY")
-POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "180"))
+POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "300"))
 POLL_INITIAL_INTERVAL = float(os.environ.get("POLL_INITIAL_INTERVAL", "0.3"))
 POLL_BACKOFF_MULTIPLIER = float(os.environ.get("POLL_BACKOFF_MULTIPLIER", "1.5"))
 POLL_MAX_INTERVAL = float(os.environ.get("POLL_MAX_INTERVAL", "5.0"))
@@ -124,11 +124,11 @@ def estimate_tokens(text: str) -> int:
 
 
 def format_tools_for_prompt(tools: List[dict]) -> str:
-    """Convert Anthropic tool definitions to text for system prompt injection."""
+    """Convert Anthropic tool definitions to compact text for system prompt injection."""
     if not tools:
         return ""
 
-    lines = ["\n\nAVAILABLE TOOLS:"]
+    lines = ["\n\nTOOLS (use <tool_call> format below):"]
     for tool in tools:
         name = tool.get("name", "")
         desc = tool.get("description", "")
@@ -136,31 +136,25 @@ def format_tools_for_prompt(tools: List[dict]) -> str:
         props = schema.get("properties", {})
         required = schema.get("required", [])
 
-        param_lines = []
+        # Compact one-line param signatures: name(param1: type, param2?: type)
+        params = []
         for pname, pinfo in props.items():
-            req_str = " (required)" if pname in required else ""
-            ptype = pinfo.get("type", "string")
-            pdesc = pinfo.get("description", "")
-            if pinfo.get("enum"):
-                pdesc += f" One of: {pinfo['enum']}"
-            param_lines.append(f"    - {pname} ({ptype}{req_str}): {pdesc}")
+            ptype = pinfo.get("type", "str")
+            opt = "" if pname in required else "?"
+            params.append(f"{pname}{opt}: {ptype}")
+        sig = f"{name}({', '.join(params)})" if params else f"{name}()"
 
-        params_str = "\n".join(param_lines) if param_lines else "    (no parameters)"
-        lines.append(f"  {name}: {desc}\n  Parameters:\n{params_str}")
+        # Truncate description to first sentence
+        short_desc = desc.split(". ")[0].split(".\n")[0]
+        if len(short_desc) > 120:
+            short_desc = short_desc[:117] + "..."
+        lines.append(f"- {sig} — {short_desc}")
 
     lines.append("""
-TO USE A TOOL, include a tool call block in your response:
-
-<tool_call>
-{"tool": "tool_name", "args": {"param1": "value1", "param2": "value2"}}
+FORMAT: <tool_call>
+{"tool": "name", "args": {"param": "value"}}
 </tool_call>
-
-RULES:
-- You may use multiple tool calls in a single response.
-- After tool execution, you will receive results and can continue.
-- When you need to use a tool, ALWAYS use the <tool_call> format above.
-- Do not fabricate tool results — wait for actual execution.
-- IMPORTANT: When a task is complete, respond with plain text (NO tool_call blocks). Do NOT repeat tool calls that have already succeeded. If a tool result shows success, move on — do not call the same tool again.""")
+Multiple calls allowed per response. When done, reply with plain text only (no <tool_call>). Do NOT repeat successful calls.""")
 
     return "\n".join(lines)
 
